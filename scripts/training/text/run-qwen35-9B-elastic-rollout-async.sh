@@ -194,7 +194,7 @@ case "${RELAX_ELASTIC_TRAIN_MODE:-fully-async}" in
    fully-async) ;;
    hybrid)
       TRAIN_MODE_ARGS=(--hybrid)
-      RESOURCE_CONFIG='{"actor": [1, 4], "rollout": [1, 2]}'
+      RESOURCE_CONFIG='{"actor": [1, 8], "rollout": [1, 2]}'
       REF_ACTOR_ARGS=()
       ;;
    *) echo "Unsupported RELAX_ELASTIC_TRAIN_MODE" >&2; exit 1 ;;

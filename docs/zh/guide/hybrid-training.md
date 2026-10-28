@@ -245,4 +245,4 @@ Hybrid 模式计划推进的工作：
 - [架构设计](./architecture.md) —— Relax 服务分层总览
 - [权重更新流水线优化](./update-weights-pipeline.md) —— `UpdateWeightFromTensor` 与 DCS 的差异
 
-9B 纯文本弹性 CE 使用 `scripts/training/text/run-qwen35-9B-elastic-rollout-hybrid.sh`，初始为 4 卡 actor 和两个单卡 rollout engine，复用 full-async 弹性 recipe 的 autoscaler 策略。Hybrid 必须保留权重备份器，不能传入 `--disable-weights-backuper`。
+9B 纯文本弹性 CE 使用 `scripts/training/text/run-qwen35-9B-elastic-rollout-hybrid.sh`，在两台 8 卡 Worker 上初始使用 8 卡 actor（TP4、DP2）和两个单卡 rollout engine，复用 full-async 弹性 recipe 的 autoscaler 策略。Hybrid 必须保留权重备份器，不能传入 `--disable-weights-backuper`。

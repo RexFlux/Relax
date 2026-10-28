@@ -243,4 +243,4 @@ Related docs:
 - [Architecture](./architecture.md) — overview of Relax's service layering
 - [Update Weights Pipeline](./update-weights-pipeline.md) — how `UpdateWeightFromTensor` and DCS differ
 
-For the 9B text elastic CE recipe, use `scripts/training/text/run-qwen35-9B-elastic-rollout-hybrid.sh`. It starts four actor GPUs and two single-GPU rollout engines, and uses the same autoscaler policy as the full-async elastic recipe. Hybrid requires the weights backuper; `--disable-weights-backuper` is rejected.
+For the 9B text elastic CE recipe, use `scripts/training/text/run-qwen35-9B-elastic-rollout-hybrid.sh`. It starts eight actor GPUs (TP4, DP2) and two single-GPU rollout engines on two eight-GPU workers, and uses the same autoscaler policy as the full-async elastic recipe. Hybrid requires the weights backuper; `--disable-weights-backuper` is rejected.

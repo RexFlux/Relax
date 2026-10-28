@@ -37,7 +37,7 @@ def test_elastic_recipe_submits_expected_training_mode(tmp_path, mode):
     command = argv[argv.index("--") + 1 :]
     assert command[:3] == ["python3", "-m", "relax.entrypoints.train"]
     resource = json.loads(command[command.index("--resource") + 1])
-    assert resource["actor"] == [1, 4]
+    assert resource["actor"] == [1, 8 if mode == "hybrid" else 4]
     assert resource["rollout"] == [1, 2]
     assert ("advantages" in resource) == (mode == "async")
     assert ("--hybrid" in command) == (mode == "hybrid")
