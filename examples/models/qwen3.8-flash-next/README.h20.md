@@ -3,7 +3,7 @@
 This recipe runs multimodal SFT on five nodes with eight H20 GPUs per node.
 It uses the full 48-layer model, one MTP layer, TP4/PP5/DP2/EP4, and the
 pipeline layout `Et*8|t*11|t*11|t*12|t*6mL` (8/11/11/12/6 layers plus MTP).
-Packing uses a 65,536-token budget and global batch size 1,024. The vision
+By default, packing uses a 65,536-token budget and global batch size 1,024. The vision
 model, vision projection, PLE, and attention indexer are frozen; PLE is
 offloaded to CPU. The frozen vision components still participate in multimodal
 forward computation. Training parameters stay on GPU, with full uniform
@@ -27,10 +27,11 @@ Model, data, output, and source directories must be accessible at the same paths
 on all nodes. Verify model configuration, tokenizer/processor, and training
 entrypoint imports in the worker environment before launching.
 
-## Configure paths
+## Configure
 
-Set these three environment variables, or fill their defaults in
-[`launch.sh`](launch.sh). No separate `launch.env` file is needed.
+[`launch.sh`](launch.sh) is the shared configuration entrypoint for paths,
+experiment names, and common training parameters. Edit its defaults or override
+them through environment variables. The three required paths are:
 
 ```bash
 export MODEL_DIR="/path/to/hf-model"
@@ -40,7 +41,39 @@ export SAVE_DIR="/path/to/run-output"
 
 `DATA_DIR` accepts an exact `.jsonl` file or a directory containing `train.jsonl`.
 `SAVE_DIR` stores submission logs. Use a distinct output directory for a separate
-experiment. The source checkout is located automatically from the launch script.
+experiment. No separate `launch.env` file is needed.
+
+| Variable             | Default                  | Purpose                                                                            |
+| -------------------- | ------------------------ | ---------------------------------------------------------------------------------- |
+| `RELAX_DIR`          | Located from `launch.sh` | Select the complete Relax checkout, including this recipe.                         |
+| `EXP_NAME`           | `qwen38-qsa-40xh20`      | Stable experiment name; launch time is appended to the ClearML task name.          |
+| `PROJECT_NAME`       | `Relax/sft/qwen38-qsa`   | ClearML project.                                                                   |
+| `NUM_STEPS`          | `10`                     | Optimizer updates requested for the run.                                           |
+| `GBS`                | `1024`                   | Global batch size; keep divisible by the fixed dense DP size of 2.                 |
+| `SEQ_LENGTH`         | `65536`                  | Sequence length and maximum input context length.                                  |
+| `MAX_TOKENS_PER_GPU` | `65536`                  | Dynamic batching/packing token budget, configured separately from sequence length. |
+| `LR` / `MIN_LR`      | `2e-5` / `2e-6`          | Peak and minimum learning rates.                                                   |
+| `LR_DECAY_ITERS`     | `2023`                   | Cosine learning-rate schedule length; not automatically changed with `NUM_STEPS`.  |
+| `LR_WARMUP_FRACTION` | `0.05`                   | Fraction of the learning-rate schedule used for warmup.                            |
+| `SEED`               | `1234`                   | Both training and data/rollout random seeds.                                       |
+
+For example, after setting the three required paths:
+
+```bash
+GBS=512 NUM_STEPS=10 EXP_NAME=qwen38-h20-gbs512 \
+bash examples/models/qwen3.8-flash-next/launch.sh
+```
+
+Both `launch.sh` and direct invocation of the training script read these defaults
+from `launch.sh`. `RELAX_DIR` may point to another complete checkout at the same
+path on all nodes; the selected checkout must contain this recipe. Its training
+script, model configuration, and worker import path are used together. For an
+existing Ray cluster, the standard Ray Jobs entrypoint also comes from that
+checkout. `MEGATRON` remains configured in the training script.
+
+Changing batch size, sequence length, or packing budget requires checking GPU
+memory and training behavior again. The fixed 40-GPU parallel layout and the
+freezing/offload settings remain in the training script.
 
 ## Launch
 
@@ -56,6 +89,14 @@ The job environment must provide `MASTER_ADDR` (the head Pod's hostname,
 matching its `POD_NAME`), `POD_NAME`, `HOST_IP`, and `WORLD_SIZE=5`. Each node uses
 eight GPUs by default. Use this entrypoint on dedicated job nodes; it cleans
 stale processes and starts a new Ray cluster.
+
+Set these node variables in the job environment before starting the SPMD
+entrypoint. It reads `WORLD_SIZE` before executing `launch.sh`, so setting
+`WORLD_SIZE` inside `launch.sh` would be too late.
+
+To use another checkout for a TorchJob, invoke both `spmd-multinode.sh` and
+`launch.sh` from that checkout. `RELAX_DIR` in `launch.sh` cannot switch an SPMD
+entrypoint that has already started.
 
 For an **existing Ray cluster**, run only on the Ray head instead:
 

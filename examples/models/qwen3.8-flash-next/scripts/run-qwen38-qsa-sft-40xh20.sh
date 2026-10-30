@@ -9,7 +9,13 @@
 set -eo pipefail
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-RELAX_ROOT="$(cd -- "${SCRIPT_DIR}/../../../.." && pwd)"
+source "${SCRIPT_DIR}/../launch.sh"
+# RELAX_DIR selects the complete checkout, including this recipe and its model config.
+TARGET_SCRIPT="${RELAX_DIR}/examples/models/qwen3.8-flash-next/scripts/run-qwen38-qsa-sft-40xh20.sh"
+if [[ ! "${BASH_SOURCE[0]}" -ef "${TARGET_SCRIPT}" ]]; then
+    exec bash "${TARGET_SCRIPT}" "$@"
+fi
+RELAX_ROOT="${RELAX_DIR}"
 export RELAX="${RELAX_ROOT}"
 source "${RELAX_ROOT}/scripts/models/qwen38-flash-next.sh"
 for ((i=0; i<${#MODEL_ARGS[@]}; i++)); do
@@ -22,8 +28,6 @@ export MEGATRON="${MEGATRON:-/root/Megatron-LM}"
 export RAY_JOBS_ADDRESS="${RAY_JOBS_ADDRESS:-http://127.0.0.1:8265}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
-export EXP_NAME="${EXP_NAME:-qwen38-qsa-40xh20}"
-export PROJECT_NAME="${PROJECT_NAME:-Relax/sft/qwen38-qsa}"
 now=$(date "+%Y%m%d-%H%M%S")
 export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
@@ -143,7 +147,7 @@ CKPT_ARGS=(
     --hf-checkpoint "${MODEL_DIR}"
     --ref-load "${MODEL_DIR}"
     --megatron-to-hf-mode bridge
-    --num-rollout "${NUM_STEPS:-10}"
+    --num-rollout "${NUM_STEPS}"
 )
 
 PROMPT_DATA="${DATA_DIR}"
@@ -158,12 +162,12 @@ SFT_ARGS=(
     --sft-invalid-multimodal-strategy error
     --sft-oversize-strategy skip
     --calculate-per-token-loss
-    --rollout-max-context-len 65536
-    --global-batch-size 1024
+    --rollout-max-context-len "${SEQ_LENGTH}"
+    --global-batch-size "${GBS}"
     --micro-batch-size 1
-    --seq-length 65536
+    --seq-length "${SEQ_LENGTH}"
     --use-dynamic-batch-size
-    --max-tokens-per-gpu 65536
+    --max-tokens-per-gpu "${MAX_TOKENS_PER_GPU}"
     --data-pad-size-multiplier 4096
     --per-rank-fetch
     --sft-prefetch-num-workers 16
@@ -182,11 +186,11 @@ SFT_ARGS=(
 
 OPTIMIZER_ARGS=(
     --optimizer adam
-    --lr 2e-5
+    --lr "${LR}"
     --lr-decay-style cosine
-    --lr-decay-iters 2023
-    --min-lr 2e-6
-    --lr-warmup-fraction 0.05
+    --lr-decay-iters "${LR_DECAY_ITERS}"
+    --min-lr "${MIN_LR}"
+    --lr-warmup-fraction "${LR_WARMUP_FRACTION}"
     --lr-warmup-init 0
     --weight-decay 0.1
     --adam-beta1 0.9
@@ -198,8 +202,8 @@ OPTIMIZER_ARGS=(
 )
 
 MISC_ARGS=(
-    --seed 1234
-    --rollout-seed 1234
+    --seed "${SEED}"
+    --rollout-seed "${SEED}"
     --bf16
     --attention-dropout 0.0
     --hidden-dropout 0.0
