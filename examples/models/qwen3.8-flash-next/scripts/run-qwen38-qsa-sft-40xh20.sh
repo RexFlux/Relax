@@ -3,7 +3,7 @@
 # Qwen3.8 full-48L multimodal SFT: 5 x 8 H20, TP4/PP5/DP2/EP4, MTP1.
 # Layout: 8/11/11/12/6+MTP; 64K packing, GBS1024, frozen CPU PLE.
 # Fresh HF initialization; this recipe does not save checkpoints.
-# Usage: MODEL_DIR=... DATA_DIR=... SAVE_DIR=... MEGATRON=... bash <this-script>
+# Usage: MODEL_DIR=... DATA_DIR=... SAVE_DIR=... bash <this-script>
 # DATA_DIR is the exact prompt file or a directory containing train.jsonl.
 # DRY_RUN=1 prints the command without network, GPU imports or output writes.
 set -eo pipefail
@@ -18,7 +18,8 @@ done
 : "${MODEL_DIR:?Set MODEL_DIR to the HF model directory}"
 : "${DATA_DIR:?Set DATA_DIR to the prompt-data directory or file}"
 : "${SAVE_DIR:?Set SAVE_DIR to a persistent run output directory}"
-: "${MEGATRON:?Set MEGATRON to the compatible Megatron-LM checkout}"
+export MEGATRON="${MEGATRON:-/root/Megatron-LM}"
+export RAY_JOBS_ADDRESS="${RAY_JOBS_ADDRESS:-http://127.0.0.1:8265}"
 export RAY_NO_WAIT="${RAY_NO_WAIT-}"
 export RELAX_SKIP_CLUSTER_CLEANUP="${RELAX_SKIP_CLUSTER_CLEANUP:-1}"
 export EXP_NAME="${EXP_NAME:-qwen38-qsa-40xh20}"
@@ -28,7 +29,6 @@ export SUBMISSION_ID="${SUBMISSION_ID:-${EXP_NAME}-${now}-$$}"
 
 # This branch must precede the standard entrypoint: that helper cleans old jobs.
 if [[ "${DRY_RUN:-0}" != 1 && -z "${RELAX_ENTRYPOINT_MODE:-}" ]]; then
-    : "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs HTTP endpoint}"
     # Admission observes active training jobs without changing other jobs or groups.
     python3 - "${RAY_JOBS_ADDRESS}" <<'PYADMIT'
 import sys
@@ -41,6 +41,17 @@ PYADMIT
     exec bash "${RELAX}/scripts/entrypoint/ray-job.sh" "${BASH_SOURCE[0]}" "$@"
 fi
 
+# Preserve the library paths supplied by the standard entrypoint for both the
+# driver and training actors. The entrypoint may only set them in runtime JSON.
+BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
+if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
+ENTRYPOINT_LD_LIBRARY_PATH=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${LD_LIBRARY_PATH:-}" <<'PYLIBS'
+import json
+import sys
+print(json.loads(sys.argv[1]).get("env_vars", {}).get("LD_LIBRARY_PATH", sys.argv[2]))
+PYLIBS
+)
+
 # Explicit driver/actor settings override entrypoint defaults (notably connections=1).
 ENV_ARGS=(
     RELAX_SKIP_NONFINITE_GRAD=0
@@ -50,7 +61,7 @@ ENV_ARGS=(
     "TRITON_CACHE_DIR=${TRITON_CACHE_DIR:-${TMPDIR:-/tmp}/relax-qwen38/triton}"
     "CUDA_CACHE_PATH=${CUDA_CACHE_PATH:-${TMPDIR:-/tmp}/relax-qwen38/cuda}"
     QWEN38_PLE_CPU_OFFLOAD=1
-    "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-}"
+    "LD_LIBRARY_PATH=${ENTRYPOINT_LD_LIBRARY_PATH}"
     RELAX_PROPAGATE_ENV_VARS=MEGATRON,SAVE_DIR,LD_LIBRARY_PATH
     "PYTHONPATH=${RELAX}:${MEGATRON}"
     "MEGATRON=${MEGATRON}"
@@ -96,8 +107,6 @@ import sys
 print(json.dumps(dict(item.split("=", 1) for item in sys.argv[1:])))
 PYENV
 )
-BASE_RUNTIME_ENV_JSON="${RUNTIME_ENV_JSON:-}"
-if [[ -z "${BASE_RUNTIME_ENV_JSON}" ]]; then BASE_RUNTIME_ENV_JSON='{}'; fi
 RUNTIME_ENV_JSON=$(python3 - "${BASE_RUNTIME_ENV_JSON}" "${TRAIN_ENV_JSON}" <<'PYRUNTIME'
 import json
 import sys
@@ -233,7 +242,6 @@ PYDRY
     exit 0
 fi
 
-: "${RAY_JOBS_ADDRESS:?Set RAY_JOBS_ADDRESS to the Ray Jobs HTTP endpoint}"
 cd "${RELAX}"
 mkdir -p "${SAVE_DIR}/logs"
 ray job submit ${RAY_NO_WAIT:+--no-wait} --address="${RAY_JOBS_ADDRESS}" \
