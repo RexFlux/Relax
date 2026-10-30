@@ -1,5 +1,7 @@
 # Qwen3.8 Flash Next SFT on 40 H20 GPUs
 
+[中文](./README.h20.zh-CN.md)
+
 This recipe runs multimodal SFT on five nodes with eight H20 GPUs per node.
 It uses the full 48-layer model, one MTP layer, TP4/PP5/DP2/EP4, and the
 pipeline layout `Et*8|t*11|t*11|t*12|t*6mL` (8/11/11/12/6 layers plus MTP).
