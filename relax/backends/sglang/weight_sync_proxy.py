@@ -106,12 +106,53 @@ class _CudaWireSize:
         )
 
 
+class _StagingArena:
+    """Reuse fenced storage even while NCCL/IPC retain inactive Python
+    references."""
+
+    def __init__(self, capacity: int, device: Any) -> None:
+        import torch
+
+        if type(capacity) is not int or capacity <= 0:
+            raise ValueError("Positive staging capacity required")
+        self.storage = torch.empty(capacity, dtype=torch.uint8, device=device)
+        self.free = [(0, capacity)]
+        self.active: dict[int, tuple[int, int]] = {}
+
+    def reserve(self, key: int, size: int) -> Any:
+        if key in self.active or type(size) is not int or size < 0:
+            raise ValueError("Invalid or repeated arena reservation")
+        if not size:
+            self.active[key] = (0, 0)
+            return self.storage[:0]
+        charged = (size + 3) // 4 * 4
+        for index, (offset, available) in enumerate(self.free):
+            if size <= available:
+                charged = min(charged, available)
+                self.active[key] = (offset, charged)
+                self.free[index : index + 1] = [(offset + charged, available - charged)] if charged < available else []
+                return self.storage[offset : offset + size]
+        raise ValueError("Retained round storage exceeds the staging arena")
+
+    def release(self, key: int) -> None:
+        offset, size = self.active.pop(key)
+        if size:
+            blocks = sorted([*self.free, (offset, size)])
+            self.free = []
+            for start, length in blocks:
+                if self.free and self.free[-1][0] + self.free[-1][1] == start:
+                    previous, count = self.free.pop()
+                    self.free.append((previous, count + length))
+                else:
+                    self.free.append((start, length))
+
+
 def _child(connection: Connection) -> None:
     """The allocating process serializes IPC and survives ambiguous
     consumption."""
     import torch
 
-    group, buffers, workers = None, {}, []
+    group, buffers, workers, arena = None, {}, [], None
     try:
         config = connection.recv()
         workers = config["workers"]
@@ -129,6 +170,7 @@ def _child(connection: Connection) -> None:
                 total_bytes=total,
                 allocated_bytes=torch.cuda.memory_allocated(device),
                 reserved_bytes=torch.cuda.memory_reserved(device),
+                staging_capacity_bytes=0,
             )
         )
         while True:
@@ -139,11 +181,16 @@ def _child(connection: Connection) -> None:
                     key, batch = command["round"], command["batch"]
                     if key in buffers:
                         raise ValueError("A proxy round is already retained")
-                    retained = sum(item["slab"].numel() for item in buffers.values())
-                    free, _ = torch.cuda.mem_get_info(device)
-                    if retained + batch["bytes"] > command["budget"] or batch["bytes"] > free:
-                        raise ValueError("Proxy staging exceeds admitted or physically free memory")
-                    slab, works = group.receive(batch)
+                    if arena is None:
+                        free, _ = torch.cuda.mem_get_info(device)
+                        reusable = torch.cuda.memory_reserved(device) - torch.cuda.memory_allocated(device)
+                        if command["budget"] > free + reusable:
+                            raise ValueError("Proxy arena exceeds physically available memory")
+                        arena = _StagingArena(command["budget"], device)
+                    if arena.storage.numel() != command["budget"]:
+                        raise ValueError("A live proxy arena cannot change capacity")
+                    slab = arena.reserve(key, batch["bytes"])
+                    slab, works = group.receive(batch, slab)
                     buffers[key] = dict(slab=slab, works=works, exported=False, complete=False)
                     del slab, works
                     result = dict(success=True, posted=True)
@@ -156,6 +203,7 @@ def _child(connection: Connection) -> None:
                     result = dict(
                         success=True,
                         retained_payload_bytes=sum(v["slab"].numel() for v in buffers.values()),
+                        staging_capacity_bytes=arena.storage.numel(),
                         cuda_allocated_bytes=torch.cuda.memory_allocated(device),
                         cuda_reserved_bytes=torch.cuda.memory_reserved(device),
                         cuda_process_peak_allocated_bytes=torch.cuda.max_memory_allocated(device),
@@ -178,6 +226,8 @@ def _child(connection: Connection) -> None:
                         raise ValueError("Cannot release an in-flight NCCL receive")
                     del buffers[command["round"]]
                     del item
+                    arena.release(command["round"])
+                    torch.cuda.ipc_collect()
                     result = dict(success=True)
                 elif op == "memory":
                     free, total = torch.cuda.mem_get_info(device)
@@ -188,6 +238,8 @@ def _child(connection: Connection) -> None:
                         total_bytes=total,
                         allocated_bytes=torch.cuda.memory_allocated(device),
                         reserved_bytes=torch.cuda.memory_reserved(device),
+                        staging_capacity_bytes=arena.storage.numel() if arena is not None else 0,
+                        retained_payload_bytes=sum(v["slab"].numel() for v in buffers.values()),
                     )
                 elif op == "close":
                     if buffers and not _workers_exited(workers):

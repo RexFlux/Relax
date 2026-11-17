@@ -108,7 +108,8 @@ def test_rounds_preserve_recipient_order_alignment_and_full_fallback_before_tran
     assert [e["frame"] for r in rounds for e in r["b"]["entries"]] == [0, 2]
     assert all(e["offset"] % 4 == 0 for r in rounds for b in r.values() for e in b["entries"])
     assert select_overlap(rounds, requested=True, full=True, budget_bytes=10)[0] is False
-    assert select_overlap(rounds, requested=True, full=False, budget_bytes=10)[0] is True
+    assert select_overlap(rounds, requested=True, full=False, budget_bytes=10)[0] is False
+    assert select_overlap(rounds, requested=True, full=False, budget_bytes=12)[0] is True
     assert select_overlap(rounds, requested=True, full=False, budget_bytes=9)[0] is False
     with pytest.raises(ValueError, match="single-frame"):
         plan_rounds(frames, ("a", "b"), 5)

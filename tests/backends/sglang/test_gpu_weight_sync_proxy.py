@@ -23,6 +23,7 @@ from relax.backends.sglang.weight_sync_proxy import (
 from relax.distributed.weight_sync.gpu_payload import apply_raw_slice
 from relax.distributed.weight_sync.gpu_transport import GpuSyncGroup, plan_rounds
 from relax.distributed.weight_sync.streaming_delta import SnapshotBudget, StreamingDeltaEncoder
+from relax.utils.logging_utils import get_logger
 
 
 def _source(pipe, connection):
@@ -61,6 +62,49 @@ def _consumer(pipe):
         del control, raw, weights
         gc.collect()
         torch.cuda.ipc_collect()
+        pipe.send("consumed_and_fenced")
+
+
+def _arena_source(pipe, connection, capacity):
+    torch.cuda.set_device(0)
+    group = GpuSyncGroup(connection, rank=0, device=torch.device("cuda", 0), timeout_s=60)
+    storage = torch.empty(capacity, device="cuda:0", dtype=torch.uint8)
+    pipe.send("joined")
+    while True:
+        command = pipe.recv()
+        if command is None:
+            group.close()
+            return
+        size, value = command
+        raw = storage[:size].fill_(value)
+        batch = dict(entries=[dict(frame=0, offset=0, bytes=size, owner=0)], bytes=size)
+        group.send(
+            [dict(id=0, owner=0)], {"receiver": batch}, {0: raw}, {"receiver": 1}, deadline=time.monotonic() + 60
+        )
+        pipe.send("sent")
+
+
+def _arena_consumer(pipe):
+    from sglang.srt.utils import MultiprocessingSerializer
+    from sglang.srt.utils.patch_torch import monkey_patch_torch_reductions
+
+    torch.cuda.set_device(1)
+    monkey_patch_torch_reductions()
+    pipe.send(dict(pid=os.getpid(), uuid=str(torch.cuda.get_device_properties(1).uuid)))
+    inactive = []
+    while True:
+        serialized = pipe.recv()
+        if serialized is None:
+            return
+        weights = MultiprocessingSerializer.deserialize(serialized)
+        control, raw = weights[0]
+        value = json.loads(control)["value"]
+        assert bool(torch.all(raw == value).cpu())
+        torch.cuda.synchronize(1)
+        # These objects deliberately survive their consumption fence. No
+        # subsequent operation reads them; a producer may safely reuse storage.
+        inactive.append(raw)
+        del weights
         pipe.send("consumed_and_fenced")
 
 
@@ -299,6 +343,73 @@ def test_two_sources_route_multiple_rounds_to_two_ipc_consumers_including_empty_
             assert process.exitcode == 0
     finally:
         _cleanup(consumer_processes, [p for p in processes if p not in consumer_processes])
+
+
+@pytest.mark.skipif(os.environ.get("RELAX_RUN_GPU_PROXY_COMPONENT") != "1", reason="requires explicit GPU ownership")
+def test_staging_arena_gpu_peak_is_bounded_with_old_ipc_references_retained():
+    if torch.cuda.device_count() < 2:
+        pytest.skip("requires one source and a same-GPU proxy/consumer pair")
+    capacity = 64 << 20
+    context = mp.get_context("spawn")
+    with socket.socket() as port_socket:
+        port_socket.bind(("127.0.0.1", 0))
+        port = port_socket.getsockname()[1]
+    connection = dict(init_method=f"tcp://127.0.0.1:{port}", world_size=2, group_name=f"proxy-arena-{os.getpid()}")
+    consumer_parent, consumer_child = context.Pipe()
+    source_parent, source_child = context.Pipe()
+    proxy_parent, proxy_child = context.Pipe()
+    consumer = context.Process(target=_arena_consumer, args=(consumer_child,))
+    source = context.Process(target=_arena_source, args=(source_child, connection, capacity))
+    proxy = context.Process(target=_child, args=(proxy_child,))
+    processes = []
+    samples = []
+    try:
+        consumer.start()
+        processes.append(consumer)
+        identity = _reply(consumer_parent)
+        source.start()
+        processes.append(source)
+        proxy.start()
+        processes.append(proxy)
+        proxy_parent.send(
+            dict(connection=connection, rank=1, device=1, timeout_s=60, workers=[_process_identity(identity["pid"])])
+        )
+        assert _reply(source_parent) == "joined"
+        assert _reply(proxy_parent)["uuid"] == identity["uuid"]
+        for round_id in range(12):
+            size, value = (48 << 20 if round_id % 3 != 2 else 16 << 20), round_id + 1
+            batch = dict(bytes=size, entries=[dict(frame=0, offset=0, bytes=size, owner=0)])
+            proxy_parent.send(dict(op="receive", round=round_id, batch=batch, budget=capacity))
+            source_parent.send((size, value))
+            assert _reply(proxy_parent)["success"]
+            assert _reply(source_parent) == "sent"
+            proxy_parent.send(dict(op="ready", round=round_id, deadline=time.monotonic() + 60))
+            ready = _reply(proxy_parent)
+            assert ready["retained_payload_bytes"] == size
+            assert ready["staging_capacity_bytes"] == capacity
+            assert ready["cuda_process_peak_allocated_bytes"] <= capacity + (4 << 20)
+            proxy_parent.send(dict(op="export", round=round_id, control=dict(value=value)))
+            consumer_parent.send(_reply(proxy_parent)["serialized"])
+            assert _reply(consumer_parent) == "consumed_and_fenced"
+            proxy_parent.send(dict(op="release", round=round_id, consumed=True))
+            assert _reply(proxy_parent)["success"]
+            proxy_parent.send(dict(op="memory"))
+            released = _reply(proxy_parent)
+            assert released["retained_payload_bytes"] == 0
+            assert released["allocated_bytes"] <= capacity + (4 << 20)
+            samples.append(dict(round=round_id, ready=ready, released=released))
+        get_logger(__name__).info("staging_arena_gpu_samples=%s", json.dumps(samples))
+        consumer_parent.send(None)
+        consumer.join(10)
+        assert consumer.exitcode == 0
+        proxy_parent.send(dict(op="close"))
+        assert _reply(proxy_parent)["success"]
+        source_parent.send(None)
+        for process in processes:
+            process.join(10)
+            assert process.exitcode == 0
+    finally:
+        _cleanup([p for p in processes if p is consumer], [p for p in processes if p is not consumer])
 
 
 @pytest.mark.skipif(os.environ.get("RELAX_RUN_GPU_PROXY_COMPONENT") != "1", reason="requires explicit GPU ownership")

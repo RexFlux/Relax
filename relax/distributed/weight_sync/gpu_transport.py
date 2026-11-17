@@ -56,8 +56,13 @@ def select_overlap(rounds: list[dict], *, requested: bool, full: bool, budget_by
     if full:
         return False, "initial_or_periodic_FULL"
     members = tuple(rounds[0]) if rounds else ()
-    if any(sum(batch[member]["bytes"] for batch in rounds) > budget_bytes for member in members):
-        return False, "complete_payload_exceeds_staging_budget"
+    for member in members:
+        retained = 0
+        for batch in rounds:
+            if batch[member]["bytes"]:
+                retained = (retained + 3) // 4 * 4 + batch[member]["bytes"]
+        if retained > budget_bytes:
+            return False, "complete_payload_exceeds_staging_budget"
     return True, "complete_payload_admitted"
 
 
@@ -86,11 +91,20 @@ class GpuSyncGroup:
         dist.all_reduce(warmup, group=self.group)
         torch.cuda.synchronize(self.device)
 
-    def receive(self, batch: dict) -> tuple[Any, list]:
+    def receive(self, batch: dict, slab: Any = None) -> tuple[Any, list]:
         import torch
         import torch.distributed as dist
 
-        slab = torch.empty(batch["bytes"], dtype=torch.uint8, device=self.device)
+        if slab is None:
+            slab = torch.empty(batch["bytes"], dtype=torch.uint8, device=self.device)
+        if (
+            slab.device != self.device
+            or slab.dtype != torch.uint8
+            or slab.ndim != 1
+            or not slab.is_contiguous()
+            or slab.numel() != batch["bytes"]
+        ):
+            raise ValueError("Receive storage must match the admitted byte slab")
         works = [
             dist.irecv(slab[e["offset"] : e["offset"] + e["bytes"]], src=e["owner"], group=self.group)
             for e in batch["entries"]

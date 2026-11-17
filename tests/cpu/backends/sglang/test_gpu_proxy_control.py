@@ -9,6 +9,36 @@ import sys
 from pathlib import Path
 
 
+def test_fenced_staging_arena_reuses_storage_despite_inactive_retained_views():
+    import pytest
+    import torch
+
+    from relax.backends.sglang.weight_sync_proxy import _StagingArena
+
+    arena = _StagingArena(12, "cpu")
+    first = arena.reserve(0, 6)
+    first.fill_(17)
+    second = arena.reserve(1, 4)
+    assert second.storage_offset() == 8
+    with pytest.raises(ValueError, match="exceeds"):
+        arena.reserve(2, 1)
+    empty = arena.reserve(3, 0)
+    assert empty.numel() == 0
+    arena.release(3)
+    arena.release(0)
+    replacement = arena.reserve(4, 6)
+    assert replacement.data_ptr() == first.data_ptr()
+    replacement.fill_(29)
+    assert torch.equal(first, replacement)  # Old references stay valid but have no live consumer after its fence.
+    arena.release(1)
+    arena.release(4)
+    assert arena.free == [(0, 12)] and not arena.active
+    odd = _StagingArena(7, "cpu")
+    assert odd.reserve(0, 7).numel() == 7
+    odd.release(0)
+    assert odd.free == [(0, 7)]
+
+
 def test_fragmented_controls_round_trip_before_and_after_sglang_cuda_reducer_patch():
     # SGLang patches the global Torch reducer. One isolated CPU process is
     # necessary to exercise that real dependency interaction without changing

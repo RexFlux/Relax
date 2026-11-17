@@ -466,10 +466,7 @@ def install_gpu_memory_update(
                 actual = [name for _order, name, _source, item in ordered if member in item["members"]]
                 if actual != expected:
                     raise ValueError("GPU owner stream order disagrees with receiver adapter")
-        rounds = plan_rounds(frames, members, config.staging_budget_bytes)
-        effective, reason = select_overlap(
-            rounds, requested=config.overlap, full=full, budget_bytes=config.staging_budget_bytes
-        )
+        plan_rounds(frames, members, config.staging_budget_bytes)  # Validate before creating any proxy process.
         connection = getattr(updater, "_gpu_connection", None)
         if connection is None:
             with socket.socket() as sock:
@@ -484,11 +481,8 @@ def install_gpu_memory_update(
             updater._gpu_connection = connection
         return dict(
             frames=frames,
-            rounds=rounds,
             members=members,
             connection=connection,
-            effective_overlap=effective,
-            overlap_reason=reason,
         )
 
     plan = root_call(build_plan)
@@ -519,8 +513,8 @@ def install_gpu_memory_update(
     joined = root_call(lambda: ray.get(join_refs, timeout=remaining(deadline)), "proxy_join_result_wait_s")
 
     def admit():
-        effective, reason = plan["effective_overlap"], plan["overlap_reason"]
         requirements = {}
+        capacities, available = [], []
         for target, identities in zip(targets, joined, strict=True):
             for member, control, names, identity in zip(
                 target["members"], target["controls"], target["streams"], identities, strict=True
@@ -541,23 +535,46 @@ def install_gpu_memory_update(
                     default=0,
                 )
                 future = (cache if version == 0 else 0) + workspace + scratch
-                largest = max(batch[member]["bytes"] for batch in plan["rounds"])
-                whole = sum(batch[member]["bytes"] for batch in plan["rounds"])
-                if future + largest > identity["free_bytes"]:
-                    raise ValueError(f"GPU {identity['uuid']} lacks physical headroom for one staged round and loader")
-                if effective and future + whole > identity["free_bytes"]:
-                    effective, reason = False, "complete_payload_exceeds_physical_headroom"
+                capacity = identity.get("staging_capacity_bytes", 0)
+                capacities.append(capacity)
+                available.append(identity["free_bytes"] - future)
                 requirements[member] = dict(
                     cache_bytes=cache,
                     workspace_bytes=workspace,
                     scratch_bytes=scratch,
-                    largest_round_bytes=largest,
-                    complete_payload_bytes=whole,
                     physically_free_bytes=identity["free_bytes"],
+                    resident_staging_capacity_bytes=capacity,
                 )
-        return dict(effective_overlap=effective, overlap_reason=reason, admission=requirements)
+        resident = {size for size in capacities if size}
+        if len(resident) > 1:
+            raise ValueError("Fixed proxy arenas disagree on their admitted capacity")
+        if resident:
+            capacity = resident.pop()
+            if capacity > config.staging_budget_bytes or any(size == 0 for size in capacities) or min(available) < 0:
+                raise ValueError("Existing staging arena or loader exceeds current physical admission")
+        else:
+            capacity = min(config.staging_budget_bytes, min(available))
+            # Large CUDA allocations round to allocator segments. Keep a
+            # physically constrained reservation within the measured margin.
+            if capacity < config.staging_budget_bytes and capacity >= 2 << 20:
+                capacity = capacity // (2 << 20) * (2 << 20)
+        rounds = plan_rounds(plan["frames"], plan["members"], capacity)
+        effective, reason = select_overlap(rounds, requested=config.overlap, full=full, budget_bytes=capacity)
+        for member, requirement in requirements.items():
+            requirement.update(
+                largest_round_bytes=max(batch[member]["bytes"] for batch in rounds),
+                complete_payload_bytes=sum(batch[member]["bytes"] for batch in rounds),
+            )
+        return dict(
+            effective_overlap=effective,
+            overlap_reason=reason,
+            admission=requirements,
+            staging_capacity_bytes=capacity,
+            rounds=rounds,
+        )
 
     admission = root_call(admit)
+    plan["rounds"] = admission.pop("rounds")
     effective = admission["effective_overlap"]
     payloads = {
         frame["id"]: streams[frame["stream"]]["buckets"][frame["bucket"]].payload
@@ -641,7 +658,7 @@ def install_gpu_memory_update(
                         "receive",
                         round_id=round_id,
                         batches=[batch[m] for m in target["members"]],
-                        budget=config.staging_budget_bytes,
+                        budget=admission["staging_capacity_bytes"],
                         timeout=remaining(deadline),
                     )
                     for target in targets
