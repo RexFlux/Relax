@@ -10,7 +10,7 @@ from contextlib import contextmanager
 from time import monotonic
 from typing import Any, Iterable, Iterator
 
-from .memory_delta import MemoryBucket, _encode_bucket
+from .memory_delta import MemoryBucket, _encode_bucket, _encode_bucket_gpu
 
 
 def steady_state_snapshot_bytes(buckets: Iterable[MemoryBucket], *, packing_bytes: int = 0) -> int:
@@ -24,7 +24,9 @@ def steady_state_snapshot_bytes(buckets: Iterable[MemoryBucket], *, packing_byte
     if type(packing_bytes) is not int or packing_bytes < 0:
         raise ValueError("Packing bytes must be a nonnegative integer")
     snapshots, scratch, clone = 0, 0, 0
+    gpu_payload = False
     for bucket in buckets:
+        gpu_payload |= not isinstance(bucket.payload, bytes)
         width = {"bfloat16": 2, "float32": 4}.get(bucket.dtype)
         if width is None or type(bucket.elements) is not int or not 0 < bucket.elements < 2**31:
             raise ValueError("Steady-state admission requires bounded BF16/FP32 buckets")
@@ -32,7 +34,7 @@ def steady_state_snapshot_bytes(buckets: Iterable[MemoryBucket], *, packing_byte
         snapshots += size
         clone = max(clone, size)
         scratch = max(scratch, bucket.elements * (17 + 2 * width))
-    return 2 * snapshots + max(scratch, clone) + packing_bytes
+    return (3 if gpu_payload else 2) * snapshots + max(scratch, clone) + packing_bytes
 
 
 class SnapshotBudget:
@@ -78,10 +80,12 @@ class StreamingDeltaEncoder:
     references. A process failure still invalidates the entire group/stream.
     """
 
-    def __init__(self, budget: SnapshotBudget, *, bucket_bytes: int) -> None:
+    def __init__(self, budget: SnapshotBudget, *, bucket_bytes: int, gpu_payload: bool = False) -> None:
         if type(bucket_bytes) is not int or bucket_bytes <= 0:
             raise ValueError("Bucket capacity must be positive")
         self.budget, self.bucket_bytes = budget, bucket_bytes
+        self.gpu_payload = gpu_payload
+        self._payload_bytes = 0
         self.version = -1
         self.schema: str | None = None
         self._baseline: list[tuple[tuple, str, Any]] = []
@@ -173,7 +177,13 @@ class StreamingDeltaEncoder:
             # values + concatenated sparse bytes, bounded by bucket size.
             scratch_bytes = count * (17 + 2 * width) if previous is not None else 0
             with self.budget.temporary(scratch_bytes):
-                changed, encoding, payload = _encode_bucket(snapshot, previous, full=self._full)
+                encode = _encode_bucket_gpu if self.gpu_payload else _encode_bucket
+                changed, encoding, payload = encode(snapshot, previous, full=self._full)
+            # FULL aliases the pending snapshot. Sparse storage survives diff
+            # scratch and must remain charged until final ACK/commit or abort.
+            if self.gpu_payload and encoding == "sparse":
+                self.budget.reserve(len(payload))
+                self._payload_bytes += len(payload)
             self._pending.append(MemoryBucket(names, count, changed, encoding, payload, None, dtype_name))
             self._pending_snapshots.append((names, dtype_name, snapshot))
             self._pending_bytes += size
@@ -210,7 +220,8 @@ class StreamingDeltaEncoder:
         if self._next_baseline is None:
             raise RuntimeError("Prepare commit references before the collective commit gate")
         self._baseline, self._next_baseline = self._next_baseline, None
-        self.budget.release(self._baseline_bytes)
+        self.budget.release(self._baseline_bytes + self._payload_bytes)
+        self._payload_bytes = 0
         self._baseline_bytes = self._pending_bytes
         self.schema = self._pending_schema
         self.version += 1
@@ -224,7 +235,8 @@ class StreamingDeltaEncoder:
         self._current.clear()
         self._pending = self._next_baseline = None
         self._pending_snapshots = []
-        self.budget.release(self._current_bytes + self._pending_bytes)
+        self.budget.release(self._current_bytes + self._pending_bytes + self._payload_bytes)
+        self._payload_bytes = 0
         self._current_bytes = self._pending_bytes = 0
         self._pending_schema = None
         self._finished = False

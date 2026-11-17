@@ -203,7 +203,9 @@ class UpdateWeightFromShardedMemory:
             self._topology = topology
             if not self.encoders:
                 self.encoders = {
-                    f"expert:{tp}": StreamingDeltaEncoder(self.budget, bucket_bytes=self.config.bucket_bytes)
+                    f"expert:{tp}": StreamingDeltaEncoder(
+                        self.budget, bucket_bytes=self.config.bucket_bytes, gpu_payload=self.config.transport == "nccl"
+                    )
                     for tp in range(layout.tp_size)
                 }
             source_tp = mpu.get_tensor_model_parallel_world_size()
@@ -224,7 +226,9 @@ class UpdateWeightFromShardedMemory:
             error = f"{type(exc).__name__}: {exc}"
         self._gate(error)
         if rank == 0 and "nonexpert" not in self.encoders:
-            self.encoders["nonexpert"] = StreamingDeltaEncoder(self.budget, bucket_bytes=self.config.bucket_bytes)
+            self.encoders["nonexpert"] = StreamingDeltaEncoder(
+                self.budget, bucket_bytes=self.config.bucket_bytes, gpu_payload=self.config.transport == "nccl"
+            )
         version = self.version + 1
         full = self.config.full_only or self.delta_updates % self.config.anchor_interval == 0
         error, weights = None, None
@@ -316,7 +320,7 @@ class UpdateWeightFromShardedMemory:
                     f"Steady-state snapshots require an estimated {steady_snapshot_estimate} bytes, "
                     f"exceeding the shared rank budget {self.budget.limit_bytes}"
                 )
-            if (
+            if self.config.transport == "tcp" and (
                 sum(len(bucket.payload) for buckets in local.values() for bucket in buckets)
                 > self.config.host_budget_bytes
             ):
@@ -324,6 +328,22 @@ class UpdateWeightFromShardedMemory:
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
         self._gate(error)
+        if self.config.transport == "nccl":
+            return self._install_gpu(
+                local,
+                engines if rank == 0 else None,
+                lock,
+                layout=layout,
+                owner=owner,
+                world=world,
+                group=group,
+                nonce=nonce,
+                version=version,
+                full=full,
+                remaining=remaining,
+                started=started,
+                captured_at=captured_at,
+            )
         error = None
         descriptors = {}
         stream_metadata = {}
@@ -580,4 +600,115 @@ class UpdateWeightFromShardedMemory:
         )
         if rank == 0:
             logger.info("Sharded memory weight sync: %s", metrics)
+        return metrics
+
+    def _install_gpu(
+        self,
+        local,
+        engines,
+        lock,
+        *,
+        layout,
+        owner,
+        world,
+        group,
+        nonce,
+        version,
+        full,
+        remaining,
+        started,
+        captured_at,
+    ) -> dict:
+        import torch
+        import torch.distributed as dist
+
+        from .common import install_gpu_memory_update
+
+        streams = {}
+        for key, buckets in local.items():
+            if key == "nonexpert":
+                name, order = f"{self.config.stream}:nonexpert", (1, 0, 0)
+                members = {f"{engine}:tp:{tp}" for engine in self.members for tp in range(layout.tp_size)}
+            else:
+                tp = int(key.split(":")[1])
+                name, order = f"{self.config.stream}:expert:{owner}:tp:{tp}", (0, owner, tp)
+                members = {f"{engine}:tp:{tp}" for engine in self.members}
+            streams[name] = dict(encoder=self.encoders[key], buckets=buckets, members=members, order=order)
+        targets = None
+        if dist.get_rank(group) == 0:
+            targets = []
+            for engine in engines:
+                identity = engine._actor_id.hex()
+                names = [
+                    [f"{self.config.stream}:expert:{source}:tp:{tp}" for source in range(world)]
+                    + [f"{self.config.stream}:nonexpert"]
+                    for tp in range(layout.tp_size)
+                ]
+                controls = [
+                    dict(
+                        adapter="native",
+                        budgets=dict(gpu_budget_bytes=self.config.receiver_gpu_budget_bytes),
+                        group=dict(
+                            stream=self.config.stream,
+                            version=version,
+                            reset=version == 0,
+                            group_update=nonce,
+                            owners=world,
+                            tp_rank=tp,
+                            tp_size=layout.tp_size,
+                            ep_size=layout.ep_size,
+                            moe_dp_size=layout.moe_dp_size,
+                            streams=[dict(stream=name) for name in names[tp]],
+                        ),
+                    )
+                    for tp in range(layout.tp_size)
+                ]
+                targets.append(
+                    dict(
+                        engine=engine,
+                        members=[f"{identity}:tp:{tp}" for tp in range(layout.tp_size)],
+                        controls=controls,
+                        streams=names,
+                    )
+                )
+
+        def committed():
+            self.version = version
+            if not self.config.full_only:
+                self.delta_updates += 1
+
+        metrics = install_gpu_memory_update(
+            self,
+            streams,
+            targets,
+            lock,
+            metadata_group=group,
+            group_update=nonce,
+            full=full,
+            version=version,
+            deadline=monotonic() + remaining(),
+            on_commit=committed,
+            update_started=started,
+        )
+        stats = dict(
+            source_rank=dist.get_rank(group),
+            owner=owner,
+            payload_bytes=sum(len(b.payload) for values in local.values() for b in values),
+            changed=sum(b.changed for values in local.values() for b in values),
+            snapshot_peak_bytes=self.budget.peak_bytes,
+            cuda_peak_allocated_bytes=torch.cuda.max_memory_allocated(),
+            cuda_peak_reserved_bytes=torch.cuda.max_memory_reserved(),
+        )
+        totals = [None] * world
+        dist.all_gather_object(totals, stats, group=group)
+        metrics.update(
+            stream=self.config.stream,
+            version=version,
+            full=full,
+            source_ranks=totals,
+            capture_encode_s=captured_at - started,
+            sync_with_probe_s=monotonic() - started,
+        )
+        if dist.get_rank(group) == 0:
+            logger.info("Sharded GPU memory weight sync: %s", metrics)
         return metrics

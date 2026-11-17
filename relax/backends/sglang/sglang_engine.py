@@ -14,7 +14,7 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Optional
+from typing import Any, Optional
 from urllib.parse import quote, urlsplit
 
 import ray
@@ -602,6 +602,9 @@ class SGLangEngine(RayActor):
             num_gpus_per_engine=self.num_gpus_per_engine,
         )
         self.node_rank = server_args_dict["node_rank"]
+        self._memory_proxy_server_args = {
+            key: server_args_dict[key] for key in ("nnodes", "tp_size", "base_gpu_id", "gpu_id_step")
+        }
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
 
@@ -1108,6 +1111,18 @@ class SGLangEngine(RayActor):
         request("update_weight_version", dict(new_version=descriptor["update"], abort_all_requests=False))
         return dict(success=True, engine=self.rank, workers=count, plan_fingerprint=plan_fingerprint)
 
+    def gpu_memory_proxy(self, action: str, **kwargs) -> Any:
+        """Thin access to this engine's own local GPU receivers."""
+        from .weight_sync_proxy import WeightSyncProxy
+
+        if action not in ("join", "receive", "ready", "begin", "consume", "finalize", "close"):
+            raise ValueError("Unsupported GPU memory proxy action")
+        if getattr(self, "_weight_sync_proxy", None) is None:
+            if action != "join":
+                raise ValueError("Initialize the GPU memory proxy before installing frames")
+            self._weight_sync_proxy = WeightSyncProxy(self)
+        return getattr(self._weight_sync_proxy, action)(**kwargs)
+
     def install_sharded_memory_update(self, controls: list[dict], timeout: float) -> dict:
         """Install one complete fixed-owner group on every TP worker."""
         import torch
@@ -1456,6 +1471,11 @@ class SGLangEngine(RayActor):
             process = getattr(self, "process", None)
             if process is not None:
                 kill_process_tree(process.pid)
+            proxy = getattr(self, "_weight_sync_proxy", None)
+            if proxy is not None:
+                # Proxy children independently pin and verify the original
+                # model process tree before releasing unresolved IPC storage.
+                proxy.close()
 
     def __del__(self):
         """Safety net: kill SGLang child processes when the actor is garbage-
@@ -2649,9 +2669,10 @@ def _compute_server_args(
         if getattr(args, "memory_weight_sync_config", None):
             from relax.backends.sglang.hf_memory_loader import HF_MEMORY_LOADER
             from relax.backends.sglang.memory_delta_loader import MEMORY_LOADER
+            from relax.backends.sglang.proxy_weight_loader import PROXY_MEMORY_LOADER
             from relax.backends.sglang.sharded_memory_loader import SHARDED_MEMORY_LOADER
 
-            for loader in (HF_MEMORY_LOADER, MEMORY_LOADER, SHARDED_MEMORY_LOADER):
+            for loader in (HF_MEMORY_LOADER, MEMORY_LOADER, SHARDED_MEMORY_LOADER, PROXY_MEMORY_LOADER):
                 if loader not in loaders:
                     loaders.append(loader)
         kwargs["custom_weight_loader"] = loaders

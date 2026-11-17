@@ -17,7 +17,7 @@ class MemoryBucket:
     elements: int
     changed: int
     encoding: str
-    payload: bytes
+    payload: Any
     snapshot: Any
     dtype: str = "bfloat16"
 
@@ -29,13 +29,20 @@ class MemoryBucket:
             "encoding": self.encoding,
             "dtype": self.dtype,
             "bytes": len(self.payload),
-            "sha256": hashlib.sha256(self.payload).hexdigest(),
         }
-        _validate_bucket_structure(metadata, self.payload, max_bytes=len(self.payload))
+        if isinstance(self.payload, bytes):
+            metadata["sha256"] = hashlib.sha256(self.payload).hexdigest()
+            _validate_bucket_structure(metadata, self.payload, max_bytes=len(self.payload))
+        else:
+            from .gpu_payload import sparse_boundaries, validate_raw_frame
+
+            metadata["integrity"] = "nccl"
+            metadata["sparse_boundaries"] = sparse_boundaries(metadata, self.payload)
+            validate_raw_frame(metadata, self.payload)
         return metadata
 
 
-def _encode_bucket(snapshot: Any, previous: Any | None, *, full: bool) -> tuple[int, str, bytes]:
+def _encode_bucket_gpu(snapshot: Any, previous: Any | None, *, full: bool) -> tuple[int, str, Any]:
     """Encode an owned BF16/FP32 snapshot using absolute raw-bit values.
 
     Callers own capture, layout validation and scratch budgeting. A missing
@@ -58,6 +65,13 @@ def _encode_bucket(snapshot: Any, previous: Any | None, *, full: bool) -> tuple[
             encoded = torch.cat(
                 [positions.to(torch.int32).view(torch.uint8), snapshot.view(words)[positions].view(torch.uint8)]
             )
+    return changed, encoding, encoded
+
+
+def _encode_bucket(snapshot: Any, previous: Any | None, *, full: bool) -> tuple[int, str, bytes]:
+    """TCP compatibility boundary; the bit encoding is shared with GPU
+    delivery."""
+    changed, encoding, encoded = _encode_bucket_gpu(snapshot, previous, full=full)
     return changed, encoding, encoded.cpu().numpy().tobytes()
 
 
@@ -156,6 +170,20 @@ def validate_bucket(metadata: dict, payload: bytes, *, max_bytes: int) -> None:
 
 
 def _validate_bucket_structure(metadata: dict, payload: bytes, *, max_bytes: int) -> None:
+    validate_bucket_directory(metadata, max_bytes=max_bytes)
+    if metadata["bytes"] != len(payload):
+        raise ValueError("Invalid memory bucket payload size")
+    if metadata["encoding"] == "sparse" and metadata["changed"]:
+        import numpy as np
+
+        positions = np.frombuffer(payload, dtype="<i4", count=metadata["changed"])
+        if positions[0] < 0 or positions[-1] >= metadata["elements"] or np.any(positions[1:] <= positions[:-1]):
+            raise ValueError("Sparse positions must be unique, sorted and in bounds")
+
+
+def validate_bucket_directory(metadata: dict, *, max_bytes: int) -> None:
+    """Validate bounded frame metadata without reading or copying its
+    payload."""
     import math
 
     for key in ("elements", "changed", "bytes"):
@@ -169,7 +197,7 @@ def _validate_bucket_structure(metadata: dict, payload: bytes, *, max_bytes: int
     if width is None:
         raise ValueError("Unsupported memory bucket dtype")
     size = count * width if encoding == "full" else changed * (4 + width) if encoding == "sparse" else -1
-    if size != len(payload) or size != metadata["bytes"] or size > max_bytes:
+    if size != metadata["bytes"] or size > max_bytes:
         raise ValueError("Invalid memory bucket payload size")
     names, total = set(), 0
     for name, shape in metadata["names"]:
@@ -181,9 +209,3 @@ def _validate_bucket_structure(metadata: dict, payload: bytes, *, max_bytes: int
         total += math.prod(shape)
     if total != count:
         raise ValueError("Memory tensor shapes do not cover the payload")
-    if encoding == "sparse" and changed:
-        import numpy as np
-
-        positions = np.frombuffer(payload, dtype="<i4", count=changed)
-        if positions[0] < 0 or positions[-1] >= count or np.any(positions[1:] <= positions[:-1]):
-            raise ValueError("Sparse positions must be unique, sorted and in bounds")

@@ -162,6 +162,41 @@ def test_sharded_real_tcp_applies_every_expert_and_preserves_fp32_bits(geometry,
         encoder.close()
 
 
+@pytest.mark.parametrize("failure", ["directory", "loader"])
+def test_native_round_session_poison_prevents_retrying_failed_directory_or_final_loader(failure):
+    model = TinyMoE()
+    receiver = ShardedMemoryReceiver(model, gpu_budget_bytes=1 << 20)
+    with ExitStack() as stack:
+        control, sources, _expected = _publish(stack, {}, "round-session", 0)
+        receiver.begin(control)
+        if failure == "directory":
+            manifest = dict(sources[0][1]._pending, group_update="wrong")
+            with pytest.raises(ValueError, match="Mixed source"):
+                receiver.begin_stream(0, manifest)
+        else:
+            for index, (_encoder, source) in enumerate(sources):
+                receiver.begin_stream(index, source._pending)
+                for frame, bucket in enumerate(source._buckets):
+                    raw = (
+                        torch.frombuffer(bytearray(bucket.payload), dtype=torch.uint8)
+                        if bucket.payload
+                        else torch.empty(0, dtype=torch.uint8)
+                    )
+                    receiver.consume(index, frame, raw)
+
+            def failing_loader(_weights):
+                raise RuntimeError("ordinary loader failed after native slices were written")
+
+            original = model.load_weights
+            model.load_weights = failing_loader
+            with pytest.raises(RuntimeError, match="ordinary loader failed"):
+                receiver.finalize()
+            model.load_weights = original
+        assert receiver.poisoned and receiver._control is None and receiver.version == -1
+        with pytest.raises(ValueError, match="incomplete"):
+            receiver.finalize()
+
+
 @pytest.mark.parametrize("failure", ["mixed-update", "missing-owner", "stream-set", "budget", "receiver-ep"])
 def test_partial_group_failure_never_advances_and_requires_new_full(failure):
     receiver = ShardedMemoryReceiver(TinyMoE(), gpu_budget_bytes=1 << 20)

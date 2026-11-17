@@ -74,6 +74,8 @@ class HFMemoryReceiver:
         self.peak_bytes = 0
         self._cache: list[Any] = []
         self._blocked_streams: set[str] = set()
+        self._active: dict | None = None
+        self._consumed = 0
         self._storage = _parameter_storage(model)
         if not self._storage:
             raise ValueError("HF receiver requires live model parameters")
@@ -96,6 +98,7 @@ class HFMemoryReceiver:
     def poison(self, stream: str | None = None) -> None:
         """Invalidate both the active stream and a failed incoming stream."""
         self.poisoned = True
+        self._active = None
         for value in (self.stream, stream):
             if isinstance(value, str) and value:
                 self._blocked_streams.add(value)
@@ -117,13 +120,13 @@ class HFMemoryReceiver:
             self.poison(manifest.get("stream"))
             raise
 
-    def _preflight(self, manifest: dict, payloads: list[bytes | bytearray]) -> tuple[tuple, int, int]:
-        from relax.distributed.weight_sync.memory_delta import _validate_bucket_structure
+    def _preflight(self, manifest: dict, payloads: list | None = None) -> tuple[tuple, int, int]:
+        from relax.distributed.weight_sync.memory_delta import _validate_bucket_structure, validate_bucket_directory
 
         metadata = manifest.get("buckets")
-        if not isinstance(metadata, list) or not metadata or len(metadata) != len(payloads):
+        if not isinstance(metadata, list) or not metadata or (payloads is not None and len(metadata) != len(payloads)):
             raise ValueError("HF update requires a complete bucket directory")
-        if sum(map(len, payloads)) > self.host_budget_bytes:
+        if payloads is not None and sum(map(len, payloads)) > self.host_budget_bytes:
             raise ValueError("HF update exceeds its host budget")
         stream, version, base = manifest.get("stream"), manifest.get("version"), manifest.get("base")
         if not isinstance(stream, str) or not stream or stream in self._blocked_streams:
@@ -144,8 +147,10 @@ class HFMemoryReceiver:
         seen: set[str] = set()
         layout = []
         cache_bytes = staging_bytes = 0
-        for item, payload in zip(metadata, payloads, strict=True):
-            _validate_bucket_structure(item, payload, max_bytes=self.host_budget_bytes)
+        for index, item in enumerate(metadata):
+            validate_bucket_directory(item, max_bytes=self.receiver_gpu_budget_bytes)
+            if payloads is not None:
+                _validate_bucket_structure(item, payloads[index], max_bytes=self.host_budget_bytes)
             if fresh and item["encoding"] != "full":
                 raise ValueError("A new HF stream requires every frame in FULL form")
             names = tuple((name, tuple(shape)) for name, shape in item["names"])
@@ -157,7 +162,7 @@ class HFMemoryReceiver:
             layout.append((names, dtype))
             cache_bytes += item["elements"] * (2 if dtype == "bfloat16" else 4)
             scratch = item["changed"] * 8 if item["encoding"] == "sparse" else 0
-            staging_bytes = max(staging_bytes, len(payload) + scratch)
+            staging_bytes = max(staging_bytes, item["bytes"] + scratch)
         layout = tuple(layout)
         schema = hashlib.sha256(json.dumps(layout, separators=(",", ":")).encode()).hexdigest()
         if schema != manifest["schema"]:
@@ -172,12 +177,25 @@ class HFMemoryReceiver:
 
     def _apply_validated(self, manifest: dict, payloads: list[bytes | bytearray]) -> None:
         """Consume transport-owned frames already integrity checked by TCP."""
+        try:
+            self._preflight(manifest, payloads)
+            self.begin(manifest)
+            for index, payload in enumerate(payloads):
+                self.consume(index, payload)
+            self.finalize()
+        except BaseException:
+            self.poison(manifest.get("stream"))
+            raise
+
+    def begin(self, manifest: dict) -> None:
+        """Validate the complete directory once; frames may then arrive in
+        rounds."""
         import torch
 
-        from relax.backends.sglang.weight_write_coverage import record_parameter_write_coverage
-
         try:
-            layout, cache_bytes, required = self._preflight(manifest, payloads)
+            if self._active is not None:
+                raise RuntimeError("An HF update is already being consumed")
+            layout, cache_bytes, required = self._preflight(manifest)
             fresh = manifest["stream"] != self.stream
             self.poisoned = True
             if fresh:
@@ -196,9 +214,42 @@ class HFMemoryReceiver:
                     )
                 self.cache_bytes = cache_bytes
             self.peak_bytes = max(self.peak_bytes, required)
+            self._active, self._consumed = manifest, 0
+        except BaseException:
+            self.poison(manifest.get("stream"))
+            raise
+
+    def consume(self, index: int, payload: Any) -> None:
+        import torch
+
+        from relax.distributed.weight_sync.gpu_payload import validate_raw_frame
+
+        manifest = self._active
+        try:
+            if manifest is None or type(index) is not int or index != self._consumed:
+                raise ValueError("HF frames must be consumed exactly once in directory order")
+            item = manifest["buckets"][index]
+            if isinstance(payload, torch.Tensor):
+                validate_raw_frame(item, payload)
             with torch.no_grad():
-                for cache, item, payload in zip(self._cache, manifest["buckets"], payloads, strict=True):
-                    self._apply_frame(cache, item, payload)
+                self._apply_frame(self._cache[index], item, payload)
+            self._consumed += 1
+        except BaseException:
+            self.poison(manifest.get("stream") if manifest else None)
+            raise
+
+    def finalize(self) -> None:
+        """Run the ordinary loader/derived refresh and commit once after all
+        frames."""
+        import torch
+
+        from relax.backends.sglang.weight_write_coverage import record_parameter_write_coverage
+
+        manifest = self._active
+        try:
+            if manifest is None or self._consumed != len(manifest["buckets"]):
+                raise ValueError("Cannot finalize an incomplete HF directory")
+            with torch.no_grad():
                 names = {name for bucket, _dtype in self.cache_schema for name, _shape in bucket}
                 with record_parameter_write_coverage(self.model, required_hf_names=names) as coverage:
                     self.model.load_weights(coverage.tag_weights(self._named_weights()))
@@ -208,19 +259,21 @@ class HFMemoryReceiver:
             self.stream, self.schema = manifest["stream"], manifest["schema"]
             self.version, self.update = manifest["version"], manifest["update"]
             self.poisoned = False
+            self._active = None
         except BaseException:
-            self.poison(manifest.get("stream"))
+            self.poison(manifest.get("stream") if manifest else None)
             raise
 
-    def _apply_frame(self, cache: Any, item: dict, payload: bytes | bytearray) -> None:
+    def _apply_frame(self, cache: Any, item: dict, payload: Any) -> None:
         import torch
 
-        if not payload:
+        if len(payload) == 0:
             return
         # TCP private_buffers=True already owns a writable host allocation.
         # Direct callers provide bytes, which need one writable host wrapper.
-        host = payload if isinstance(payload, bytearray) else bytearray(payload)
-        raw = torch.frombuffer(host, dtype=torch.uint8).to(self.device)
+        from relax.distributed.weight_sync.gpu_payload import payload_to_device
+
+        raw = payload_to_device(payload, self.device)
         words = torch.int16 if cache.element_size() == 2 else torch.int32
         if item["encoding"] == "full":
             cache.view(words).copy_(raw.view(words))

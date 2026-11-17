@@ -349,3 +349,391 @@ def _named_params_and_buffers_global(
                     middle_path += "."
                 layer_idx = int(layer_idx) + layer_offset
                 yield f"module.module.{middle_path}decoder.layers.{layer_idx}.{rest}", buffer
+
+
+def install_gpu_memory_update(
+    updater,
+    streams: dict,
+    targets: list | None,
+    lock,
+    *,
+    metadata_group,
+    group_update: str,
+    full: bool,
+    version: int,
+    deadline: float,
+    on_commit: Callable[[], None],
+    update_started: float,
+) -> dict:
+    """One fixed all-source plan, engine finalization, then the existing ACK
+    gate.
+
+    Only small frame directories cross Gloo. Each owner sends its own GPU
+    buffers directly to the intended TP proxies; rank zero coordinates
+    controls.
+    """
+    import hashlib
+    import secrets
+    import socket
+    from time import monotonic, sleep
+
+    import ray
+
+    from relax.backends.sglang.proxy_weight_loader import json_bytes
+    from relax.distributed.weight_sync.gpu_transport import (
+        GpuSyncGroup,
+        plan_rounds,
+        remaining,
+        select_overlap,
+    )
+
+    rank, world = dist.get_rank(metadata_group), dist.get_world_size(metadata_group)
+    root = dist.get_process_group_ranks(metadata_group)[0]
+    config = updater.config
+    started = monotonic()
+    stages = {}
+
+    def gate(error):
+        errors = [None] * world
+        dist.all_gather_object(errors, error, group=metadata_group)
+        if any(errors):
+            raise RuntimeError(f"GPU memory source gate failed: {errors}")
+
+    def root_call(action, label=None):
+        result = [None]
+        if rank == 0:
+            try:
+                action_started = monotonic()
+                result[0] = dict(value=action())
+                if label is not None:
+                    stages[label] = stages.get(label, 0.0) + monotonic() - action_started
+            except Exception as exc:
+                result[0] = dict(error=f"{type(exc).__name__}: {exc}")
+        dist.broadcast_object_list(result, src=root, group=metadata_group)
+        if "error" in result[0]:
+            raise RuntimeError(result[0]["error"])
+        return result[0]["value"]
+
+    local, error = {}, None
+    try:
+        for name, item in streams.items():
+            manifest = dict(
+                stream=name,
+                version=version,
+                base=version - 1,
+                reset=version == 0,
+                schema=item["encoder"].pending_schema,
+                group_update=group_update,
+                buckets=[bucket.metadata() for bucket in item["buckets"]],
+            )
+            manifest["update"] = hashlib.sha256(json_bytes(manifest)).hexdigest()
+            local[name] = dict(manifest=manifest, members=sorted(item["members"]), order=item["order"])
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    gate(error)
+    gathered = [None] * world
+    dist.all_gather_object(gathered, local, group=metadata_group)
+    owners = [source for source, item in enumerate(gathered) if item]
+    owner_rank = {source: index for index, source in enumerate(owners)}
+    manifests = {name: item["manifest"] for items in gathered for name, item in items.items()}
+    if sum(map(len, gathered)) != len(manifests):
+        raise ValueError("GPU source streams have duplicate owners")
+
+    def build_plan():
+        members = tuple(member for target in targets for member in target["members"])
+        frames = []
+        ordered = sorted(
+            (tuple(item["order"]), name, source, item)
+            for source, items in enumerate(gathered)
+            for name, item in items.items()
+        )
+        for _order, name, source, item in ordered:
+            for bucket, metadata in enumerate(item["manifest"]["buckets"]):
+                frames.append(
+                    dict(
+                        id=len(frames),
+                        stream=name,
+                        bucket=bucket,
+                        owner=owner_rank[source],
+                        bytes=metadata["bytes"],
+                        recipients=item["members"],
+                    )
+                )
+        for target in targets:
+            if len(target["members"]) != len(target["streams"]) or len(target["controls"]) != len(target["members"]):
+                raise ValueError("GPU target controls disagree with actual worker topology")
+            for member, expected in zip(target["members"], target["streams"], strict=True):
+                actual = [name for _order, name, _source, item in ordered if member in item["members"]]
+                if actual != expected:
+                    raise ValueError("GPU owner stream order disagrees with receiver adapter")
+        rounds = plan_rounds(frames, members, config.staging_budget_bytes)
+        effective, reason = select_overlap(
+            rounds, requested=config.overlap, full=full, budget_bytes=config.staging_budget_bytes
+        )
+        connection = getattr(updater, "_gpu_connection", None)
+        if connection is None:
+            with socket.socket() as sock:
+                sock.bind(("", 0))
+                port = sock.getsockname()[1]
+            host = ray.util.get_node_ip_address()
+            connection = dict(
+                init_method=f"tcp://[{host}]:{port}" if ":" in host else f"tcp://{host}:{port}",
+                world_size=len(owners) + len(members),
+                group_name="relax-gpu-" + secrets.token_hex(12),
+            )
+            updater._gpu_connection = connection
+        return dict(
+            frames=frames,
+            rounds=rounds,
+            members=members,
+            connection=connection,
+            effective_overlap=effective,
+            overlap_reason=reason,
+        )
+
+    plan = root_call(build_plan)
+    receiver_ranks = {member: len(owners) + index for index, member in enumerate(plan["members"])}
+    join_refs = None
+    if rank == 0:
+        join_refs = [
+            target["engine"].gpu_memory_proxy.remote(
+                "join",
+                connection=plan["connection"],
+                ranks=[receiver_ranks[m] for m in target["members"]],
+                timeout=remaining(deadline),
+            )
+            for target in targets
+        ]
+    error = None
+    try:
+        if rank in owner_rank and getattr(updater, "_gpu_group", None) is None:
+            updater._gpu_group = GpuSyncGroup(
+                plan["connection"],
+                rank=owner_rank[rank],
+                device=torch.device("cuda", torch.cuda.current_device()),
+                timeout_s=remaining(deadline),
+            )
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+    gate(error)
+    joined = root_call(lambda: ray.get(join_refs, timeout=remaining(deadline)), "proxy_join_result_wait_s")
+
+    def admit():
+        effective, reason = plan["effective_overlap"], plan["overlap_reason"]
+        requirements = {}
+        for target, identities in zip(targets, joined, strict=True):
+            for member, control, names, identity in zip(
+                target["members"], target["controls"], target["streams"], identities, strict=True
+            ):
+                cache_names = names if control["adapter"] == "hf" else names[-1:]
+                cache = sum(
+                    bucket["elements"] * {"bfloat16": 2, "float32": 4}[bucket["dtype"]]
+                    for name in cache_names
+                    for bucket in manifests[name]["buckets"]
+                )
+                workspace = control["budgets"].get("loader_workspace_budget_bytes", cache)
+                scratch = max(
+                    (
+                        bucket["changed"] * 8 if bucket["encoding"] == "sparse" else 0
+                        for name in names
+                        for bucket in manifests[name]["buckets"]
+                    ),
+                    default=0,
+                )
+                future = (cache if version == 0 else 0) + workspace + scratch
+                largest = max(batch[member]["bytes"] for batch in plan["rounds"])
+                whole = sum(batch[member]["bytes"] for batch in plan["rounds"])
+                if future + largest > identity["free_bytes"]:
+                    raise ValueError(f"GPU {identity['uuid']} lacks physical headroom for one staged round and loader")
+                if effective and future + whole > identity["free_bytes"]:
+                    effective, reason = False, "complete_payload_exceeds_physical_headroom"
+                requirements[member] = dict(
+                    cache_bytes=cache,
+                    workspace_bytes=workspace,
+                    scratch_bytes=scratch,
+                    largest_round_bytes=largest,
+                    complete_payload_bytes=whole,
+                    physically_free_bytes=identity["free_bytes"],
+                )
+        return dict(effective_overlap=effective, overlap_reason=reason, admission=requirements)
+
+    admission = root_call(admit)
+    effective = admission["effective_overlap"]
+    payloads = {
+        frame["id"]: streams[frame["stream"]]["buckets"][frame["bucket"]].payload
+        for frame in plan["frames"]
+        if frame["stream"] in streams
+    }
+    # Pin the source payloads on ambiguous transport failure. Encoder abort must
+    # not recycle storage still referenced by an outstanding NCCL operation.
+    updater._gpu_active_payloads = payloads
+    acquired = False
+    timings = {}
+
+    def engine_call(action, arguments):
+        return ray.get(
+            [
+                target["engine"].gpu_memory_proxy.remote(action, **kwargs, timeout=remaining(deadline))
+                for target, kwargs in zip(targets, arguments, strict=True)
+            ],
+            timeout=remaining(deadline),
+        )
+
+    def pause():
+        ray.get(
+            [target["engine"].pause_generation.remote(timeout=remaining(deadline)) for target in targets],
+            timeout=remaining(deadline),
+        )
+
+    def begin():
+        return engine_call(
+            "begin",
+            [
+                dict(controls=t["controls"], manifests=[[manifests[name] for name in names] for names in t["streams"]])
+                for t in targets
+            ],
+        )
+
+    def consume(round_id, batch):
+        arguments = []
+        for target in targets:
+            entries = []
+            for member, names in zip(target["members"], target["streams"], strict=True):
+                indices = {name: index for index, name in enumerate(names)}
+                entries.append(
+                    [
+                        [
+                            indices[plan["frames"][entry["frame"]]["stream"]],
+                            plan["frames"][entry["frame"]]["bucket"],
+                            entry["offset"],
+                            entry["bytes"],
+                        ]
+                        for entry in batch[member]["entries"]
+                    ]
+                )
+            arguments.append(dict(round_id=round_id, entries=entries))
+        return engine_call("consume", arguments)
+
+    try:
+
+        def acquire():
+            nonlocal acquired
+            while not ray.get(lock.acquire.remote(), timeout=remaining(deadline)):
+                sleep(min(0.05, remaining(deadline)))
+            acquired = True
+
+        root_call(acquire, "lock_acquire_s")
+        if not effective:
+            timings["paused_at"] = monotonic()
+            root_call(pause, "pause_calls_s")
+            root_call(begin, "begin_and_directories_s")
+        for round_id, batch in enumerate(plan["rounds"]):
+            transport_started = monotonic()
+            receive_refs = None
+
+            def dispatch_receive():
+                nonlocal receive_refs
+                # NCCL creates peer communicators lazily. Waiting for irecv's
+                # posted reply before any source enters isend can deadlock the
+                # first pair initialization despite the all-reduce warmup.
+                receive_refs = [
+                    target["engine"].gpu_memory_proxy.remote(
+                        "receive",
+                        round_id=round_id,
+                        batches=[batch[m] for m in target["members"]],
+                        budget=config.staging_budget_bytes,
+                        timeout=remaining(deadline),
+                    )
+                    for target in targets
+                ]
+
+            root_call(dispatch_receive)
+            error = None
+            try:
+                if rank in owner_rank:
+                    updater._gpu_group.send(plan["frames"], batch, payloads, receiver_ranks, deadline=deadline)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+            gate(error)
+            root_call(lambda: ray.get(receive_refs, timeout=remaining(deadline)))
+            readiness = root_call(lambda: engine_call("ready", [dict(round_id=round_id) for _ in targets]))
+            if rank == 0:
+                stages["transport_and_ready_wall_s"] = (
+                    stages.get("transport_and_ready_wall_s", 0.0) + monotonic() - transport_started
+                )
+            if not effective:
+                root_call(lambda: consume(round_id, batch), "ipc_apply_and_fence_calls_s")
+        if effective:
+            timings["paused_at"] = monotonic()
+            root_call(pause, "pause_calls_s")
+            root_call(begin, "begin_and_directories_s")
+            for round_id, batch in enumerate(plan["rounds"]):
+                root_call(lambda: consume(round_id, batch), "ipc_apply_and_fence_calls_s")
+        loaded = root_call(
+            lambda: engine_call(
+                "finalize",
+                [
+                    dict(
+                        update=manifests[target["streams"][0][0]]["update"]
+                        if target["controls"][0]["adapter"] == "hf"
+                        else group_update,
+                    )
+                    for target in targets
+                ],
+            ),
+            "finalize_loader_and_version_calls_s",
+        )
+        error = None
+        try:
+            for name, item in streams.items():
+                item["encoder"].prepare_commit(set(local[name]["members"]), set(item["members"]))
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        gate(error)
+        error = None
+        try:
+            for item in streams.values():
+                item["encoder"].commit()
+            on_commit()
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+        gate(error)
+        updater._gpu_active_payloads = None
+
+        def resume():
+            ray.get(
+                [t["engine"].continue_generation.remote(timeout=remaining(deadline)) for t in targets],
+                timeout=remaining(deadline),
+            )
+            ready = monotonic()
+            ray.get(
+                [t["engine"].memory_weight_generation_probe.remote(remaining(deadline)) for t in targets],
+                timeout=remaining(deadline),
+            )
+            return dict(
+                sync_to_ready_s=ready - update_started,
+                generation_pause_s=ready - timings["paused_at"],
+                install_to_ready_s=ready - started,
+                probe_s=monotonic() - ready,
+                stages=stages,
+            )
+
+        timing_result = root_call(resume)
+        return dict(
+            transport="nccl",
+            **admission,
+            receivers=loaded,
+            rounds=len(plan["rounds"]),
+            frames=len(plan["frames"]),
+            proxy_last_round_memory=readiness,
+            logical_delivery_bytes=sum(f["bytes"] * len(f["recipients"]) for f in plan["frames"]),
+            full_delivery_bytes=sum(
+                b["elements"] * {"bfloat16": 2, "float32": 4}[b["dtype"]] * len(item["members"])
+                for items in gathered
+                for item in items.values()
+                for b in item["manifest"]["buckets"]
+            ),
+            **timing_result,
+        )
+    finally:
+        root_call(lambda: ray.get(lock.release.remote(), timeout=10) if acquired else None)

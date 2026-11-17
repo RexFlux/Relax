@@ -61,6 +61,9 @@ class MemorySyncConfig:
     anchor_interval: int = 20
     full_only: bool = False
     receiver_gpu_budget_bytes: int = 12 << 30
+    transport: str = "tcp"
+    overlap: bool = False
+    staging_budget_bytes: int = 512 << 20
 
     @classmethod
     def load(cls, path: str | Path) -> "MemorySyncConfig":
@@ -77,14 +80,21 @@ class MemorySyncConfig:
             "sync_timeout_s",
             "anchor_interval",
             "receiver_gpu_budget_bytes",
+            "staging_budget_bytes",
         ):
             integer(getattr(config, name), 1)
         if type(config.full_only) is not bool:
             raise WeightSyncError("full_only must be a boolean")
+        if config.transport not in ("tcp", "nccl") or type(config.overlap) is not bool:
+            raise WeightSyncError("Memory transport must be tcp/nccl and overlap must be a boolean")
+        if config.overlap and config.transport != "nccl":
+            raise WeightSyncError("Receive overlap currently requires the GPU NCCL proxy transport")
         if config.layout == "qwen35_owner_local":
             config = replace(config, layout="native_gated_moe")
         if config.layout not in ("dense", "canonical_hf", "native_gated_moe"):
             raise WeightSyncError("Unsupported memory application strategy")
+        if config.transport == "nccl" and config.layout == "dense":
+            raise WeightSyncError("The legacy direct Dense adapter retains its TCP transport")
         return config
 
 

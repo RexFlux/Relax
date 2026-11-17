@@ -94,6 +94,33 @@ def _apply(receiver, manifest, buckets) -> None:
     receiver.apply(manifest, [bucket.payload for bucket in buckets])
 
 
+def test_hf_round_session_loads_once_after_all_raw_frames_and_rejects_incomplete_finalize() -> None:
+    values = _values()
+    encoder = StreamingDeltaEncoder(SnapshotBudget(1 << 20), bucket_bytes=128, gpu_payload=True)
+    model = OrdinaryModel()
+    receiver = _receiver(model)
+    for step in range(3):
+        if step == 1:
+            values[0][1].view(torch.int16)[0] = -32768
+            values[3][1].view(torch.int32)[-1] = 0x7F800001
+        manifest, buckets = _capture(encoder, values, full=step == 2)
+        receiver.begin(manifest)
+        prior = model.calls
+        for index, bucket in enumerate(buckets):
+            receiver.consume(index, bucket.payload)
+            assert model.calls == prior and receiver.version == step - 1
+        receiver.finalize()
+        assert model.calls == prior + 1
+        _assert_full_oracle(model, values)
+        _commit(encoder)
+    manifest, _buckets = _capture(encoder, values)
+    receiver.begin(manifest)
+    with pytest.raises(ValueError, match="incomplete"):
+        receiver.finalize()
+    assert receiver.poisoned and receiver._active is None and model.calls == 3
+    encoder.close()
+
+
 def _assert_bits(actual, expected) -> None:
     assert actual.dtype == expected.dtype
     assert torch.equal(actual.contiguous().view(torch.uint8), expected.contiguous().view(torch.uint8))

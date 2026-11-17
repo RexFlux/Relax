@@ -46,7 +46,11 @@ class UpdateWeightFromMemory:
             self.canonical_hf and args.megatron_to_hf_mode == "bridge" and not getattr(args, "num_experts", None)
         )
         self.encoder = (
-            StreamingDeltaEncoder(SnapshotBudget(self.config.gpu_budget_bytes), bucket_bytes=self.config.bucket_bytes)
+            StreamingDeltaEncoder(
+                SnapshotBudget(self.config.gpu_budget_bytes),
+                bucket_bytes=self.config.bucket_bytes,
+                gpu_payload=self.config.transport == "nccl",
+            )
             if self.canonical_hf
             else MemoryDeltaEncoder(
                 bucket_bytes=self.config.bucket_bytes, snapshot_budget_bytes=self.config.gpu_budget_bytes
@@ -144,6 +148,18 @@ class UpdateWeightFromMemory:
                 pass
         errors = [None] * dist.get_world_size(group)
         dist.all_gather_object(errors, error, group=group)
+        if not any(errors) and self.config.transport == "nccl":
+            try:
+                metrics = self._install_gpu(rollout_manager, buckets, group=group, started=started)
+                if rank == 0:
+                    logger.info("GPU memory weight sync: %s", metrics)
+                return
+            except Exception:
+                self.failed = True
+                self.encoder.abort()
+                if rank == 0:
+                    self._close_generation(rollout_manager)
+                raise
         result = [None]
         if rank == 0:
             try:
@@ -206,7 +222,77 @@ class UpdateWeightFromMemory:
             logger.error("Memory failure quarantine unconfirmed: %s", error)
         return errors
 
-    def _install(self, rollout_manager, buckets, update_started: float) -> dict:
+    def _install_gpu(self, manager, buckets, *, group, started: float) -> dict:
+        import torch.distributed as dist
+
+        from .common import install_gpu_memory_update
+
+        rank, targets, lock = dist.get_rank(group), None, None
+        status = [None]
+        capture_s = monotonic() - started
+        if rank == 0:
+            try:
+                context = self._install(manager, buckets, started, resolve_only=True)
+                lock = context["lock"]
+                workspace = sum(b.elements * {"bfloat16": 2, "float32": 4}[b.dtype] for b in buckets)
+                targets = []
+                for engine in context["engines"]:
+                    members = self.receiver_plan.group_members(engine._actor_id.hex())
+                    targets.append(
+                        dict(
+                            engine=engine,
+                            members=members,
+                            streams=[[self.config.stream] for _ in members],
+                            controls=[
+                                dict(
+                                    adapter="hf",
+                                    plan_fingerprint=self.receiver_plan.fingerprint,
+                                    budgets=dict(
+                                        host_budget_bytes=self.config.host_budget_bytes,
+                                        receiver_gpu_budget_bytes=self.config.receiver_gpu_budget_bytes,
+                                        loader_workspace_budget_bytes=workspace,
+                                    ),
+                                )
+                                for _ in members
+                            ],
+                        )
+                    )
+                status[0] = dict(
+                    plan=self.receiver_plan.fingerprint,
+                    version=self.encoder.version + 1,
+                    full=all(b.encoding == "full" for b in buckets),
+                )
+            except Exception as exc:
+                status[0] = dict(error=f"{type(exc).__name__}: {exc}")
+        dist.broadcast_object_list(status, src=self.source_ranks[0], group=group)
+        if "error" in status[0]:
+            raise RuntimeError(status[0]["error"])
+        streams = (
+            {self.config.stream: dict(encoder=self.encoder, buckets=buckets, members=self.members, order=(0, 0, 0))}
+            if rank == 0
+            else {}
+        )
+        metrics = install_gpu_memory_update(
+            self,
+            streams,
+            targets,
+            lock,
+            metadata_group=group,
+            group_update=status[0]["plan"],
+            full=status[0]["full"],
+            version=status[0]["version"],
+            deadline=monotonic() + self.config.sync_timeout_s,
+            on_commit=lambda: None,
+            update_started=started,
+        )
+        return dict(
+            **metrics,
+            version=status[0]["version"],
+            capture_encode_s=capture_s,
+            sync_with_probe_s=monotonic() - started,
+        )
+
+    def _install(self, rollout_manager, buckets, update_started: float, *, resolve_only: bool = False) -> dict:
         import ray
 
         deadline = monotonic() + self.config.sync_timeout_s
@@ -275,6 +361,8 @@ class UpdateWeightFromMemory:
             raise RuntimeError("Inference membership changed; restart with a new memory stream")
         self.members = members
         resolved_at = monotonic()
+        if resolve_only:
+            return dict(engines=engines, lock=lock, capability_fingerprints=capability_fingerprints)
         if self.source is None:
             self.source = MemorySource(
                 ray.util.get_node_ip_address(),
