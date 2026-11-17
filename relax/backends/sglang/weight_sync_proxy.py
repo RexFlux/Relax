@@ -299,17 +299,23 @@ class WeightSyncProxy:
         return self._receive_replies(deadline=deadline)
 
     def join(self, connection: dict, ranks: list[int], *, timeout: float) -> list:
-        from multiprocessing import Pipe
-
-        import psutil
-
         if self.connection is not None:
             if self.connection != connection or [item["rank"] for item in self.identities] != ranks:
                 raise ValueError("Proxy process group or member mapping changed")
             return self._commands([dict(op="memory")] * len(ranks), deadline=time.monotonic() + timeout)
-        args = self.engine._memory_proxy_server_args
+        args = getattr(self.engine, "_memory_proxy_server_args", {})
+        if not isinstance(args, dict) or any(
+            type(args.get(key)) is not int for key in ("nnodes", "tp_size", "base_gpu_id", "gpu_id_step")
+        ):
+            raise ValueError("GPU proxy requires resolved integer GPU topology")
         if args["nnodes"] != 1 or args["tp_size"] != len(ranks) or self.children:
             raise ValueError("GPU proxy requires one fixed local process per actual TP GPU")
+        if args["base_gpu_id"] < 0 or args["gpu_id_step"] <= 0:
+            raise ValueError("GPU proxy requires a nonnegative base device and a positive device step")
+        from multiprocessing import Pipe
+
+        import psutil
+
         root = psutil.Process(self.engine.process.pid)
         workers = [_process_identity(p.pid) for p in [root, *root.children(recursive=True)]]
         if len(workers) <= 1:

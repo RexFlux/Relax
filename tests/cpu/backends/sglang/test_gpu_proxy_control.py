@@ -9,6 +9,26 @@ import sys
 from pathlib import Path
 
 
+def test_gpu_join_rejects_unresolved_topology_before_allocating_any_child(monkeypatch):
+    from types import SimpleNamespace
+
+    import pytest
+
+    from relax.backends.sglang import weight_sync_proxy
+
+    def unexpected_child(*args, **kwargs):
+        pytest.fail("An invalid GPU topology must not start a producer")
+
+    monkeypatch.setattr(weight_sync_proxy.subprocess, "Popen", unexpected_child)
+    complete = dict(nnodes=1, tp_size=1, base_gpu_id=0, gpu_id_step=1)
+    for missing in ("nnodes", "tp_size", "base_gpu_id", "gpu_id_step"):
+        topology = {key: value for key, value in complete.items() if key != missing}
+        proxy = weight_sync_proxy.WeightSyncProxy(SimpleNamespace(_memory_proxy_server_args=topology))
+        with pytest.raises(ValueError, match="resolved integer GPU topology"):
+            proxy.join({}, [1], timeout=1)
+        assert not proxy.children and proxy.connection is None
+
+
 def test_fenced_staging_arena_reuses_storage_despite_inactive_retained_views():
     import pytest
     import torch

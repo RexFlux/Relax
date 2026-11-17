@@ -603,7 +603,9 @@ class SGLangEngine(RayActor):
         )
         self.node_rank = server_args_dict["node_rank"]
         self._memory_proxy_server_args = {
-            key: server_args_dict[key] for key in ("nnodes", "tp_size", "base_gpu_id", "gpu_id_step")
+            key: server_args_dict[key]
+            for key in ("nnodes", "tp_size", "base_gpu_id", "gpu_id_step")
+            if key in server_args_dict
         }
         self.server_host = server_args_dict["host"]  # with [] if ipv6
         self.server_port = server_args_dict["port"]
