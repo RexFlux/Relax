@@ -32,7 +32,6 @@ def _args(**overrides):
         use_rollout_indexer_replay=False,
         lora_rank=0,
         lora_adapter_mode=False,
-        slime_router_sticky=False,
         custom_convert_samples_to_train_data_path=None,
     )
     values.update(overrides)
@@ -386,7 +385,6 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
         sglang_router_ip="localhost",
         sglang_router_port=1,
         use_rollout_routing_replay=False,
-        use_slime_router=False,
         sglang_router_policy="round_robin",
         sglang_sampling_backend="pytorch",
         partial_rollout=True,
@@ -411,6 +409,7 @@ def test_score_centering_native_generation_appends_resume_without_rescoring(monk
 def test_score_centering_converter_flattens_candidates_and_rejects_missing_fields(monkeypatch):
     tensordict = ModuleType("tensordict")
     tensordict.TensorDict = dict
+    tensordict.TensorDictBase = dict
     monkeypatch.setitem(sys.modules, "tensordict", tensordict)
     monkeypatch.setattr(importlib.import_module("relax.utils"), "utils", None, raising=False)
     previous = sys.modules.pop("relax.utils.utils", None)

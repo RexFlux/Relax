@@ -52,6 +52,7 @@ def sglang_engine_module(monkeypatch):
     env = ModuleType("relax.utils.env")
     env.Envs = SimpleNamespace(
         RELAX_REPLAY_REFERENCES=False,
+        RELAX_MODEL_LOADING_TIMEOUT_S=0,
         RELAX_SCALE_OUT_MAX_REASON_ITEMS=3,
         RELAX_SCALE_OUT_MAX_REASON_ITEM_LEN=120,
         RELAX_SCALE_OUT_MAX_REASON_TOTAL_LEN=512,
@@ -149,7 +150,7 @@ class _Clock:
 
 def _make_engine(sglang_engine_module):
     engine = sglang_engine_module.SGLangEngine.__new__(sglang_engine_module.SGLangEngine)
-    engine.args = SimpleNamespace(use_slime_router=False)
+    engine.args = SimpleNamespace()
     engine.node_rank = 0
     engine.worker_type = "regular"
     engine.router_ip = "router"
@@ -356,18 +357,28 @@ def test_missing_load_format_choices_fails_closed(sglang_engine_module):
         sglang_engine_module._preferred_s3_stream_load_format()
 
 
-def test_unregister_uses_registration_worker_id_once(monkeypatch, sglang_engine_module):
-    requests = _RouterRequests()
+@pytest.mark.parametrize(
+    ("version", "worker_id", "delete_path"),
+    [
+        ("0.2.3", None, "http%3A%2F%2Fworker%3A8000"),
+        ("0.3.2", "physical-worker-id", "physical-worker-id"),
+    ],
+)
+def test_router_registration_and_removal_follow_versioned_protocol(
+    monkeypatch, sglang_engine_module, version, worker_id, delete_path
+):
+    monkeypatch.setattr(sglang_engine_module.sglang_router, "__version__", version)
+    requests = _RouterRequests(worker_id=worker_id)
     monkeypatch.setattr(sglang_engine_module, "requests", requests)
     engine = _make_engine(sglang_engine_module)
 
     assert engine.register_to_router()
-    assert engine._router_worker_id == "physical-worker-id"
+    assert engine._router_worker_id == worker_id
     assert engine.unregister_from_router()
     assert engine.unregister_from_router()
 
     assert requests.posts == ["http://router:30000/workers"]
-    assert requests.deletes == ["http://router:30000/workers/physical-worker-id"]
+    assert requests.deletes == [f"http://router:30000/workers/{delete_path}"]
 
 
 def test_registration_normalizes_numeric_worker_id(monkeypatch, sglang_engine_module):

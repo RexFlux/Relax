@@ -732,7 +732,13 @@ class Rollout(Base):
 
     async def _async_check_partition_production_complete(self, partition_id: str) -> bool:
         if getattr(self.config, "fully_async", False) and getattr(self.config, "use_dynamic_batch_size", False):
-            return await self.data_system_client.async_check_production_completed(partition_id)
+            # Actor may retire the final partition before this producer resumes.
+            # Stream drain requires producer EOS, so prefetch alone is insufficient.
+            return await self.data_system_client.async_check_production_completed(
+                partition_id
+            ) or await self.data_system_client.async_check_stream_drained(
+                task_name="actor_train", partition_id=partition_id
+            )
         return await self.data_system_client.async_check_production_status(["tokens"], partition_id)
 
     @app.get("/is_eval_done")
@@ -761,13 +767,6 @@ class Rollout(Base):
 
     @app.post("/scale_out", response_model=ScaleOutResponse)
     async def scale_out(self, request: ScaleOutAPIRequest):
-        # Scale-out is incompatible with SlimeRouter (which uses fixed engine pool)
-        if getattr(self.config, "use_slime_router", False):
-            raise HTTPException(
-                status_code=400,
-                detail="Scale-out is not available when --use-slime-router is enabled. "
-                "SlimeRouter uses a fixed engine pool that does not support dynamic scaling.",
-            )
         # Idempotency is handled inside create_scale_out_request:
         #   - ray_native: computes effective delta from (num_replicas - current)
         #   - external: filters out addresses already active or in-flight
@@ -909,13 +908,6 @@ class Rollout(Base):
 
     @app.post("/scale_in", response_model=ScaleInResponse)
     async def scale_in(self, request: ScaleInAPIRequest):
-        # Scale-in is incompatible with SlimeRouter (which uses fixed engine pool)
-        if getattr(self.config, "use_slime_router", False):
-            raise HTTPException(
-                status_code=400,
-                detail="Scale-in is not available when --use-slime-router is enabled. "
-                "SlimeRouter uses a fixed engine pool that does not support dynamic scaling.",
-            )
         try:
             result = await self.rollout_manager.create_scale_in_request.remote(
                 model_name=request.model_name,

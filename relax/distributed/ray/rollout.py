@@ -53,11 +53,10 @@ from relax.utils.health_monitor import RolloutHealthMonitor
 from relax.utils.http_utils import (
     _wrap_ipv6,
     find_available_port,
-    get,
     get_host_info,
+    get_router_worker_urls,
     init_http_client,
     post,
-    router_worker_base_urls,
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.metrics.metric_checker import MetricChecker
@@ -392,6 +391,7 @@ class EngineGroup:
     sglang_overrides: dict = dataclasses.field(default_factory=dict)
     router_ip: str | None = None
     router_port: int | None = None
+    is_policy_engine: bool = True
     is_scaled_out: bool = False  # True for groups added via scale-out, False for initial groups
     skip_dcs_registration: bool = False  # Skip DCS registration for scaled-out engines
     skip_router_registration: bool = False  # Skip router registration until weight sync completes
@@ -417,7 +417,6 @@ class EngineGroup:
             and self.skip_router_registration
             and self.router_ip
             and self.router_port
-            and not getattr(self.args, "use_slime_router", False)
             and self.sglang_overrides.get("dp_size", getattr(self.args, "sglang_dp_size", 1)) == 1
             and parse(sglang_router.__version__) >= parse("0.3.0")
         )
@@ -529,6 +528,8 @@ class EngineGroup:
             rollout_num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
         )
 
+        engine_args = copy.copy(self.args)
+        engine_args._fsdp_turbo_policy_engine = self.is_policy_engine
         RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
 
         rollout_engines = []
@@ -583,6 +584,11 @@ class EngineGroup:
                     "SGLANG_OPT_USE_CUSTOM_ALL_REDUCE_V2": "0",
                 }.items()
             }
+            # Rollout-only CANN/HCCL performance knobs can hang FSDP backward if training actors inherit them.
+            for spec in Envs.RELAX_ROLLOUT_EXTRA_ENV_VARS.split(","):
+                name, sep, value = spec.strip().partition("=")
+                if name:
+                    env_vars[name] = value
             from relax.distributed.replay_manager import reference_environment
 
             env_vars.update(reference_environment())
@@ -610,7 +616,7 @@ class EngineGroup:
                 },
                 **accelerator_kwargs,
             ).remote(
-                self.args,
+                engine_args,
                 rank=global_rank,
                 worker_type=self.worker_type,
                 base_gpu_id=base_gpu_id,
@@ -1755,21 +1761,12 @@ class RolloutManager(ReloadableMixin):
         carrying images/videos/audio for each prompt; encoded inline and
         merged into the payload, mirroring the RL ``generate()`` path.
         """
-        import sglang_router
-        from packaging.version import parse
-
         from relax.engine.rollout.sglang_rollout import _encode_multimodal_inputs
 
         self.health_monitoring_resume()
 
         router_base = f"http://{self.args.sglang_router_ip}:{self.args.sglang_router_port}"
-        if parse(sglang_router.__version__) <= parse("0.2.1") or getattr(self.args, "use_slime_router", False):
-            response = await get(f"{router_base}/list_workers")
-            worker_urls = response["urls"]
-        else:
-            response = await get(f"{router_base}/workers")
-            worker_urls = [w["url"] for w in response["workers"]]
-        worker_urls = router_worker_base_urls(worker_urls)
+        worker_urls = await get_router_worker_urls(router_base)
         if not worker_urls:
             worker_urls = [router_base]
 
@@ -2032,8 +2029,7 @@ class RolloutManager(ReloadableMixin):
     def set_train_parallel_config(self, config: dict):
         self.train_parallel_config = config
 
-    # ===================== Elastic Rollout Scale-Out Methods =====================
-
+    # ===================== Elastic Rollout Scale-Out Methods ==============
     def _gc_terminal_requests(self) -> None:
         """Garbage-collect terminal scale-out/in requests to prevent unbounded
         memory growth.
@@ -2722,6 +2718,7 @@ class RolloutManager(ReloadableMixin):
                 rank_offset=engine_offset,
                 gpu_offset=0,
                 sglang_overrides=dict(template_group.sglang_overrides),
+                is_policy_engine=template_group.is_policy_engine,
                 router_ip=srv.router_ip,
                 router_port=srv.router_port,
                 is_scaled_out=True,
@@ -2823,8 +2820,10 @@ class RolloutManager(ReloadableMixin):
                 # NCCL weight sync is orchestrated via HTTP to the remote SGLang process.
                 RolloutRayActor = ray.remote(_resolve_rollout_engine_class(self.args))
                 accelerator_kwargs = get_ray_accelerator_kwargs(0.2)
+                engine_args = copy.copy(self.args)
+                engine_args._fsdp_turbo_policy_engine = srv is self.server
                 engine = RolloutRayActor.options(num_cpus=0.2, **accelerator_kwargs).remote(
-                    self.args,
+                    engine_args,
                     rank=total_engines + i,
                     worker_type="regular",
                     base_gpu_id=0,
@@ -2940,8 +2939,7 @@ class RolloutManager(ReloadableMixin):
             if all_actors:
                 await self._rollback_engines(all_actors)
 
-    # ===================== Scale-Out Helper Methods =====================
-
+    # ===================== Scale-Out Helper Methods ==============
     async def _finalize_engine_group_registration(
         self,
         request: ScaleOutRequest,
@@ -3052,6 +3050,7 @@ class RolloutManager(ReloadableMixin):
             engine_group = EngineGroup(
                 args=self.args,
                 pg=None,  # External mode doesn't need placement group
+                is_policy_engine=srv is self.server,
                 all_engines=engines,
                 engine_init_records={i: _EngineInitRecord(ref) for i, (_, ref) in enumerate(engine_init_pairs or [])},
                 num_gpus_per_engine=self.args.rollout_num_gpus_per_engine,
@@ -4929,8 +4928,7 @@ class RolloutManager(ReloadableMixin):
 
         return [r.to_dict() for r in requests]
 
-    # ===================== Eviction Monitoring =====================
-
+    # ===================== Eviction Monitoring ==============
     def _start_eviction_monitor(self):
         """Start a background thread that periodically polls engines for
         SIGTERM eviction."""
@@ -5220,7 +5218,7 @@ def _start_router(
     force_new: bool = False,
     initial_pd_workers: list[dict] | None = None,
 ) -> tuple[str | None, int | None]:
-    """Start sgl router or slime router and return (router_ip, router_port).
+    """Start the SGLang router and return (router_ip, router_port).
 
     If ``args.sglang_router_ip`` is already set (e.g. by the user) and
     ``force_new`` is False, skip launching and return the existing values. When
@@ -5237,10 +5235,19 @@ def _start_router(
         raise RuntimeError("A managed PD router is already running; reconcile it before another startup")
 
     if (
+        getattr(args, "use_rollout_routing_replay", False)
+        and not args.debug_train_only
+        and not getattr(args, "load_debug_rollout_data", None)
+    ):
+        # The Ray worker can have a different installation from the driver.
+        from relax.backends.sglang.arguments import validate_router_replay_support
+
+        validate_router_replay_support()
+
+    if (
         initial_pd_workers is None
         and not force_new
         and has_pd_disaggregation
-        and not args.use_slime_router
         and not args.debug_train_only
         and getattr(args, "router_decode_policy", None) == "power_of_two"
     ):
@@ -5272,47 +5279,34 @@ def _start_router(
         if router_port is None:
             router_port = find_available_port(random.randint(3000, 4000))
 
-    if args.use_slime_router:
-        assert not has_pd_disaggregation, "slime router does not support PD disaggregation."
-        import copy
+    from sglang_router.launch_router import RouterArgs
 
-        from relax.engine.router.router import run_router
+    from relax.utils.http_utils import run_router
 
-        router_args = copy.copy(args)
-        router_args.sglang_router_ip = bind_ip
-        router_args.sglang_router_port = router_port
+    router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
+    router_args.host = bind_ip
+    router_args.port = router_port
+    router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
+    router_args.log_level = "warn"
+    router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
 
-    else:
-        from sglang_router.launch_router import RouterArgs
+    if hasattr(args, "sglang_router_policy") and args.sglang_router_policy:
+        router_args.policy = args.sglang_router_policy
 
-        from relax.utils.http_utils import run_router
+    if has_pd_disaggregation:
+        router_args.pd_disaggregation = True
+    if initial_pd_workers is not None:
+        if not has_pd_disaggregation:
+            raise ValueError("Initial PD workers require PD disaggregation")
+        _validate_initial_pd_workers(initial_pd_workers)
+        router_args.prefill_urls = [
+            (worker["url"], worker["bootstrap_port"])
+            for worker in initial_pd_workers
+            if worker["worker_type"] == "prefill"
+        ]
+        router_args.decode_urls = [worker["url"] for worker in initial_pd_workers if worker["worker_type"] == "decode"]
 
-        router_args = RouterArgs.from_cli_args(args, use_router_prefix=True)
-        router_args.host = bind_ip
-        router_args.port = router_port
-        router_args.prometheus_port = find_available_port(random.randint(4000, 5000))
-        router_args.log_level = "warn"
-        router_args.request_timeout_secs = args.sglang_router_request_timeout_secs
-
-        if hasattr(args, "sglang_router_policy") and args.sglang_router_policy:
-            router_args.policy = args.sglang_router_policy
-
-        if has_pd_disaggregation:
-            router_args.pd_disaggregation = True
-        if initial_pd_workers is not None:
-            if not has_pd_disaggregation:
-                raise ValueError("Initial PD workers require PD disaggregation")
-            _validate_initial_pd_workers(initial_pd_workers)
-            router_args.prefill_urls = [
-                (worker["url"], worker["bootstrap_port"])
-                for worker in initial_pd_workers
-                if worker["worker_type"] == "prefill"
-            ]
-            router_args.decode_urls = [
-                worker["url"] for worker in initial_pd_workers if worker["worker_type"] == "decode"
-            ]
-
-        logger.info(f"Launch router with args: {router_args}")
+    logger.info(f"Launch router with args: {router_args}")
 
     process = multiprocessing.Process(
         target=run_router,
@@ -5584,6 +5578,18 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
     for model_idx, model_cfg in enumerate(config.models):
         model_cfg.resolve(args)
 
+        if model_idx == 0 and getattr(args, "train_backend", None) == "fsdp_turbo":
+            for group in model_cfg.engine_groups:
+                if group.worker_type == "placeholder":
+                    continue
+                for field in ("dp_size", "pp_size", "attn_dp_size"):
+                    value = group.overrides.get(field, getattr(args, f"sglang_{field}", 1))
+                    if int(value or 1) != 1:
+                        raise ValueError(f"fsdp_turbo weight synchronization requires final SGLang {field}=1")
+                tp_size = int(group.overrides.get("tp_size", group.num_gpus_per_engine))
+                if tp_size != group.num_gpus_per_engine:
+                    raise ValueError("fsdp_turbo SGLang tp_size must match the allocated GPUs per engine")
+
         has_pd = model_cfg.has_pd_disaggregation
         endpoint = (args.sglang_router_ip, args.sglang_router_port)
         managed = (
@@ -5594,7 +5600,6 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
         defer_router = (
             has_pd
             and managed
-            and not args.use_slime_router
             and getattr(args, "router_decode_policy", None) == "power_of_two"
             and not args.debug_train_only
         )
@@ -5644,6 +5649,7 @@ def _start_rollout_servers_impl(args, pg, started_groups: list[EngineGroup]) -> 
                 rank_offset=engine_offset,
                 gpu_offset=gpu_offset,
                 sglang_overrides=group_cfg.overrides,
+                is_policy_engine=model_idx == 0,
                 router_ip=router_ip,
                 router_port=router_port,
                 skip_router_registration=defer_router,
@@ -5688,20 +5694,22 @@ def _resolve_sglang_config(args) -> SglangConfig:
         expected = args.rollout_num_gpus
         actual = config.total_num_gpus
         assert actual == expected, f"sglang_config total GPUs ({actual}) != rollout_num_gpus ({expected})"
-        return config
-
-    if getattr(args, "prefill_num_servers", None) is not None:
-        return SglangConfig.from_prefill_num_servers(args)
-
-    # Default: single regular group.
-    return SglangConfig(
-        models=[
-            ModelConfig(
-                name="default",
-                engine_groups=[EngineGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
-            )
-        ]
-    )
+    elif getattr(args, "prefill_num_servers", None) is not None:
+        config = SglangConfig.from_prefill_num_servers(args)
+    else:
+        # Default: single regular group.
+        config = SglangConfig(
+            models=[
+                ModelConfig(
+                    name="default",
+                    engine_groups=[EngineGroupConfig(worker_type="regular", num_gpus=args.rollout_num_gpus)],
+                )
+            ]
+        )
+    # Both rollout and Agentic requests use the first model's endpoint. Carry
+    # its resolved topology with args so request construction need not read YAML.
+    args._sglang_router_pd_disaggregation = config.models[0].has_pd_disaggregation
+    return config
 
 
 def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any] | None = None):
@@ -5787,6 +5795,15 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
     perf_log_dict = {key: value for key, value in log_dict.items() if key.startswith(("perf/", "perf_detail/"))}
     logger.info(f"rollout {rollout_id}: {rollout_log_dict}")
     logger.info(f"perf {rollout_id}: {perf_log_dict}")
+    # Keep tuning timings visible when the full metrics line exceeds log-forwarding limits.
+    timing = {
+        key: round(value, 2)
+        for key, value in perf_log_dict.items()
+        if isinstance(value, (int, float))
+        and (key == "perf/rollout_time" or key.startswith(("perf/reward_time", "perf/genrm")))
+    }
+    if timing:
+        logger.info(f"rollout timing {rollout_id}: {timing}")
     step = compute_rollout_step(args, rollout_id)
     log_dict["rollout/step"] = step
     tracking_utils.log(args, log_dict, step_key="rollout/step")

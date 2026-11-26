@@ -58,6 +58,34 @@ export RUNTIME_ENV_JSON
 
 Keep using `ray job submit --runtime-env-json="${RUNTIME_ENV_JSON}"` in the submission command. The `scripts/entrypoint/ray-job.sh` script generates the base `RUNTIME_ENV_JSON`, so merge after that generation and before actual Job submission. Exporting variables only in the submission shell does not guarantee that they reach the remote Job.
 
+### Post-load TP barrier timeout
+
+`RELAX_MODEL_LOADING_TIMEOUT_S` independently controls how long SGLang waits for other TP ranks at the barrier after model loading. The default, `0`, preserves SGLang's timeout; a positive integer overrides it in seconds. This is neither a deadline for the entire model-loading process nor `RELAX_INFERENCE_RECOVERY_DRAIN_TIMEOUT`, and it does not require local recovery to be enabled.
+
+For a remote Ray Job, the value must also reach the inference engine. Put the following block in the training script after entrypoint environment initialization and before the actual `ray job submit`; this example selects 1800 seconds. `ray-job.sh` regenerates `RUNTIME_ENV_JSON` rather than merging a JSON value supplied before it runs. Setting that JSON in an outer shell before invoking `bash scripts/entrypoint/ray-job.sh <run-script>` therefore loses this setting.
+
+```bash
+RUNTIME_ENV_JSON="$(python - <<'PY'
+import json
+import os
+
+runtime_env = json.loads(os.environ["RUNTIME_ENV_JSON"])
+env_vars = runtime_env.setdefault("env_vars", {})
+env_vars["RELAX_MODEL_LOADING_TIMEOUT_S"] = "1800"
+propagate = [
+    env_vars.get("RELAX_PROPAGATE_ENV_VARS", ""),
+    os.environ.get("RELAX_PROPAGATE_ENV_VARS", ""),
+    "RELAX_MODEL_LOADING_TIMEOUT_S",
+]
+env_vars["RELAX_PROPAGATE_ENV_VARS"] = ",".join(filter(None, propagate))
+print(json.dumps(runtime_env))
+PY
+)"
+export RUNTIME_ENV_JSON
+```
+
+Keep `--runtime-env-json="${RUNTIME_ENV_JSON}"` on the submission command. Its `env_vars` delivers both the timeout and the forwarding list to the remote training driver. The driver uses `RELAX_PROPAGATE_ENV_VARS` to include the value in the services' runtime environment, which reaches the engine and its scheduler subprocess. The example preserves existing forwarding entries, but the list itself does not transport submission-shell variables to the remote host: both keys must be in the Job's `env_vars`. The startup log `Model loading barrier timeout: ... -> 1800s` confirms that the scheduler installed the override.
+
 ## Supported configurations and fallback
 
 Recovery supports framework-managed static resources, the Megatron training backend, standard SGLang Rollout, and GRPO. The training Actor, data queue, and recovery state service must remain available. Local recovery does not repair the training Actor itself, recover lost nodes or GPUs, or migrate or shrink resources after failure.
@@ -67,7 +95,7 @@ Recovery supports framework-managed static resources, the Megatron training back
 | Training and algorithm | `train_backend=megatron`, `advantage_estimator=grpo`, and `kl_coef=0`; do not enable `--use-kl-loss`, Critic, or OPD. |
 | Generation entrypoint | Keep the default `relax.engine.rollout.sglang_rollout.generate_rollout`; do not set `--custom-generate-function-path` or `--dynamic-sampling-filter-path`, or enable Agentic Rollout. |
 | Model and reward | Leave `--multimodal-keys` unset; do not enable `--lora-adapter-mode` or configure GenRM instances. |
-| Resources and routing | Do not use `--rollout-external`, `--autoscaler-config`, `--sglang-config`, `--sglang-router-ip`, or `--use-slime-router`. Keep framework-managed engines and routing. |
+| Resources and routing | Do not use `--rollout-external`, `--autoscaler-config`, `--sglang-config`, or `--sglang-router-ip`. Keep framework-managed engines and routing. |
 | TransferQueue | Component recovery requires SimpleStorage. A job using MooncakeStore keeps engine-level fault tolerance. With `--tq-rdma-mode=auto`, the backend selected after initialization and attach checks determines the recovery mode. |
 | Other execution options | Do not enable `--use-dynamic-global-batch-size`, `--debug-train-only`, or `--debug-rollout-only`. |
 | Colocate | Require training offload, Rollout offload, and weight backup: `offload_train=True`, `offload_rollout=True`, and `enable_weights_backuper=True`. Argument validation for `--colocate` enables offload automatically; keep weight backup enabled. |

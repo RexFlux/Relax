@@ -41,15 +41,20 @@ from relax.utils.training.eval_config import (
 logger = get_logger(__name__)
 
 
-# Minimum required TransferQueue version and the command to upgrade to it.
+# Minimum required TransferQueue version.
 _MIN_TQ_VERSION = "0.1.10.dev0"
-_TQ_UPGRADE_CMD = (
-    'pip install "transferqueue @ git+https://github.com/redai-studio/'
-    'TransferQueue.git@9784ad0d8a5f0db93ff8326379ab2a6d06e640a0" --no-deps'
-)
 
 _MTP_DETACH_PATHS = ("embedding", "backbone", "lm-head")
 _REMOVED_MTP_DETACH_FLAGS = ("--mtp-detach-main-model", "--no-mtp-detach-main-model")
+_REMOVED_SLIME_ROUTER_FLAGS = {
+    "--use-slime-router",
+    "--slime-router-middleware-paths",
+    "--slime-router-timeout",
+    "--slime-router-max-connections",
+    "--slime-router-health-check-failure-threshold",
+    "--slime-router-sticky",
+    "--slime-router-sticky-idle-secs",
+}
 
 
 def check_transfer_queue_version() -> None:
@@ -68,13 +73,16 @@ def check_transfer_queue_version() -> None:
         installed = pkg_version("transferqueue")
     except PackageNotFoundError as e:
         raise ImportError(
-            f"transferqueue is not installed. Install it with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+            "transferqueue is not installed. Fully async training requires a training image built with "
+            "Relax's TransferQueue patch. Use an image built from this Relax checkout; "
+            "see docker/patch/transferqueue/README.md."
         ) from e
 
     if parse_version(installed) < parse_version(_MIN_TQ_VERSION):
         raise RuntimeError(
             f"transferqueue {installed} is out of date (requires >= {_MIN_TQ_VERSION}). "
-            f"Upgrade with:\n    {_TQ_UPGRADE_CMD}\nor use the latest image."
+            "Fully async training requires a training image built with Relax's TransferQueue patch. "
+            "Use an image built from this Relax checkout; see docker/patch/transferqueue/README.md."
         )
 
 
@@ -2314,54 +2322,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             return add_opd_arguments(parser)
 
         def add_router_arguments(parser):
-            parser.add_argument(
-                "--use-slime-router",
-                action="store_true",
-                default=False,
-                help="Whether to use SlimeRouter for text-based routing instead of SGLang token-based routing",
-            )
-            parser.add_argument(
-                "--slime-router-middleware-paths",
-                type=str,
-                nargs="+",
-                default="",
-            )
-            parser.add_argument(
-                "--slime-router-timeout",
-                type=float,
-                default=None,
-                help="Timeout for SlimeRouter HTTP requests in seconds.",
-            )
-            parser.add_argument(
-                "--slime-router-max-connections",
-                type=int,
-                default=None,
-                help="Max connections for SlimeRouter HTTP client.",
-            )
-            parser.add_argument(
-                "--slime-router-health-check-failure-threshold",
-                type=int,
-                default=3,
-                help="Number of consecutive failures before marking a worker as unhealthy.",
-            )
-            parser.add_argument(
-                "--slime-router-sticky",
-                action="store_true",
-                default=False,
-                help="Enable sticky-session routing in SlimeRouter: pin a routing key (read from the "
-                "X-SMG-Routing-Key header) to a worker so repeated requests for the same key reuse that "
-                "worker's prefix/KV cache. Keyless requests and the initial pin fall back to least-load "
-                "selection; a live pin is never redistributed (only remapped when its worker leaves the "
-                "healthy set). Has no effect unless --use-slime-router is set.",
-            )
-            parser.add_argument(
-                "--slime-router-sticky-idle-secs",
-                type=float,
-                default=600.0,
-                help="Evict a sticky routing-key -> worker assignment after it has been idle (not routed to) "
-                "for this many seconds, bounding the map against unbounded routing-key cardinality. Scanned on "
-                "the SlimeRouter health-check cadence. Requires --slime-router-sticky.",
-            )
             RouterArgs.add_cli_args(parser, use_router_prefix=True, exclude_host_port=True)
             return parser
 
@@ -3069,6 +3029,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         from relax.backends.fsdp.arguments import add_generative_arguments
 
         parser = add_generative_arguments(parser)
+        # Keep FSDPTurbo YAML/JSON raw for Ray serialization; the train actor loads it lazily.
+        parser.add_argument(
+            "--turbo-config",
+            type=str,
+            default=None,
+            help=(
+                "FSDPTurbo config for --train-backend fsdp_turbo: path to a FSDPTurbo "
+                "YAML file (e.g. configs/turbo_config/qwen3_5_moe_35b.yaml) or inline "
+                "JSON describing the parallel / memory / quantization plan."
+            ),
+        )
         reset_arg(
             parser,
             "--custom-config-path",
@@ -3101,7 +3072,9 @@ def _pre_parse_mode():
     Phase 2 parsing.
     """
     temp_parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
-    temp_parser.add_argument("--train-backend", type=str, choices=["megatron", "fsdp"], default="megatron")
+    temp_parser.add_argument(
+        "--train-backend", type=str, choices=["megatron", "fsdp", "fsdp_turbo"], default="megatron"
+    )
     temp_parser.add_argument("--debug-rollout-only", action="store_true", default=False)
     temp_parser.add_argument("--debug-train-only", action="store_true", default=False)
     temp_parser.add_argument("--load-debug-rollout-data", type=str, default=None)
@@ -3146,6 +3119,18 @@ def _reject_removed_mtp_detach_flags(argv: list[str]) -> None:
             raise ValueError(f"{option} has been removed; use --mtp-detach-paths instead.")
 
 
+def _reject_removed_slime_router_flags(argv: list[str]) -> None:
+    for token in argv:
+        option = token.split("=", 1)[0]
+        if option in _REMOVED_SLIME_ROUTER_FLAGS:
+            raise ValueError(
+                f"{option} has been removed with the Python SlimeRouter. "
+                "Relax now uses the native SGLang router; remove the obsolete option. "
+                "For sticky routing, use --sglang-router-policy manual with --router-max-idle-secs. "
+                "See docs/en/guide/configuration.md#router-configuration for migration guidance."
+            )
+
+
 def _s3_model_download_disabled() -> bool:
     parser = argparse.ArgumentParser(add_help=False, allow_abbrev=False)
     parser.add_argument("--disable-s3-model-download", action="store_true")
@@ -3154,6 +3139,7 @@ def _s3_model_download_disabled() -> bool:
 
 
 def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
+    _reject_removed_slime_router_flags(sys.argv[1:])
     if any(token.split("=", 1)[0] == "--sft-objective" for token in sys.argv[1:]):
         raise ValueError("--sft-objective has been removed; select the training objective with --loss-type instead.")
 
@@ -3191,6 +3177,7 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
             pre.debug_rollout_only
             or pre.skip_hf_validate
             or image_sft
+            or pre.train_backend == "fsdp_turbo"
             or (model_source is not None and is_s3_uri(model_source.uri))
         ),
     )
@@ -3222,8 +3209,11 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
     # gets a per-model-family default from its adapter. Resolve the Megatron
     # fallback here so every downstream Megatron consumer keeps seeing a concrete
     # list, and leave it None for fsdp so the actor can defer to the adapter.
-    if getattr(args, "lora_target_modules", None) is None and args.train_backend != "fsdp":
+    if getattr(args, "lora_target_modules", None) is None and args.train_backend not in ("fsdp", "fsdp_turbo"):
         args.lora_target_modules = ["linear_qkv", "linear_proj"]
+
+    if args.train_backend == "fsdp_turbo" and args.lora_rank > 0:
+        raise ValueError("fsdp_turbo does not support LoRA; --lora-rank must be 0")
 
     relax_validate_args(args)
 
@@ -3231,6 +3221,12 @@ def _parse_args_impl(add_custom_arguments=None, *, model_source=None):
         from relax.backends.fsdp.arguments import validate_generative_config
 
         validate_generative_config(args)
+    elif args.train_backend == "fsdp_turbo":
+        # debug_rollout_only has no actor or backend config to validate.
+        if not args.debug_rollout_only:
+            from relax.backends.fsdp_turbo.turbo_config_utils import validate_fsdp_turbo_args
+
+            validate_fsdp_turbo_args(args)
     elif not args.debug_rollout_only:
         args = megatron_validate_args(args)
 
@@ -3391,6 +3387,23 @@ def _normalize_mtp_detach_paths(args) -> None:
     args.mtp_detach_paths = tuple(path for path in _MTP_DETACH_PATHS if path in requested_paths)
 
 
+def _supports_mtp_repeated_layer(args=None) -> bool:
+    """Return whether the active training backend supports shared-weight
+    repeated MTP layers."""
+    if getattr(args, "train_backend", "megatron") != "megatron":
+        return False
+    try:
+        from megatron.core.transformer.multi_token_prediction import MultiTokenPredictionBlock
+        from megatron.core.transformer.transformer_config import TransformerConfig
+    except ImportError:
+        return False
+
+    build_layers_code = getattr(getattr(MultiTokenPredictionBlock, "_build_layers", None), "__code__", None)
+    return hasattr(TransformerConfig, "mtp_use_repeated_layer") and (
+        build_layers_code is not None and "mtp_use_repeated_layer" in build_layers_code.co_names
+    )
+
+
 def _normalize_mtp_only_training_args(args) -> None:
     """Resolve the public MTP-only mode into existing training primitives."""
     if not getattr(args, "mtp_only_training", False):
@@ -3421,8 +3434,14 @@ def _normalize_mtp_only_training_args(args) -> None:
 
     if args.mtp_num_layers is None:
         args.mtp_num_layers = 1
-    if args.mtp_num_layers != 1:
-        raise ValueError("--mtp-only-training currently supports exactly one Qwen3.5 MTP layer.")
+    if args.mtp_num_layers < 1:
+        raise ValueError("--mtp-only-training requires at least one MTP prediction depth.")
+    if args.mtp_num_layers > 1 and not args.mtp_use_repeated_layer:
+        raise ValueError("Multiple --mtp-only-training prediction depths require --mtp-use-repeated-layer.")
+    if args.mtp_num_layers > 1 and not _supports_mtp_repeated_layer(args):
+        raise ValueError(
+            "Multiple --mtp-only-training prediction depths require backend support for --mtp-use-repeated-layer."
+        )
     if args.mtp_loss_scaling_factor <= 0:
         raise ValueError("--mtp-loss-scaling-factor must be greater than 0 with --mtp-only-training.")
 
@@ -4298,8 +4317,6 @@ def relax_validate_args(args):
             unsupported.append("partial rollout")
         if args.fully_async or args.hybrid:
             unsupported.append("fully-async/hybrid")
-        if args.use_slime_router:
-            unsupported.append("slime router")
         if args.use_agentic_rollout:
             unsupported.append("agentic rollout")
         if args.rollout_function_path != "relax.engine.rollout.sglang_rollout.generate_rollout":
@@ -4355,7 +4372,7 @@ def relax_validate_args(args):
             raise ValueError("Image SFT requires --train-backend fsdp")
         if args.start_rollout_id is None:
             args.start_rollout_id = 0
-    elif not native_art:
+    elif not native_art and args.train_backend != "fsdp_turbo":
         if args.megatron_to_hf_mode == "bridge":
             if (
                 args.load is not None
@@ -4607,7 +4624,14 @@ def relax_validate_args(args):
         # path knows how to (a) cap per-GPU tokens (CP-aware) and (b) build
         # balanced micro-batches. Static --micro-batch-size cannot do either,
         # so we require --use-dynamic-batch-size.
-        if not args.use_dynamic_batch_size and not is_i2i_sft(args):
+        # fsdp_turbo micro-batches internally using --max-tokens-per-gpu; Megatron's dynamic-batch flag does not apply.
+        if getattr(args, "train_backend", "megatron") == "fsdp_turbo":
+            if args.max_tokens_per_gpu is None:
+                raise ValueError(
+                    "--loss-type sft on fsdp_turbo requires --max-tokens-per-gpu "
+                    "(the actor packs micro-batches under this token budget)."
+                )
+        elif not args.use_dynamic_batch_size and not is_i2i_sft(args):
             raise ValueError(
                 f"--loss-type {args.loss_type} requires --use-dynamic-batch-size (with --max-tokens-per-gpu). "
                 "Offline training relies on dynamic batching to bound per-GPU tokens (CP-aware) and to filter "
@@ -4867,12 +4891,6 @@ def relax_validate_args(args):
             "please remove --disable-rollout-global-dataset to use num_epoch"
         )
 
-    _normalize_mtp_detach_paths(args)
-    _normalize_mtp_only_training_args(args)
-
-    if args.enable_mtp_training:
-        assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
-
     # --sft-chunked-logits incompatibilities are flagged here so
     # downstream (engine/sft/runtime.py should_use_sft_chunked + the three loss.py direct
     # reads of args.sft_chunked_logits) sees a single, consistent truth.
@@ -4903,9 +4921,14 @@ def relax_validate_args(args):
     if not is_offline and getattr(args, "sft_train_data_prefetch", False):
         raise ValueError("--sft-train-data-prefetch is only meaningful for offline training.")
 
-    # Custom YAML is applied late and may override any checkpoint option, so
-    # validate this mutually exclusive mode only after those overrides settle.
+    # Custom YAML is applied late and may override any checkpoint or MTP option, so
+    # validate these modes only after those overrides settle.
     validate_save_lora_only_args(args)
+    _normalize_mtp_detach_paths(args)
+    _normalize_mtp_only_training_args(args)
+
+    if args.enable_mtp_training:
+        assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
     if args.eval_max_context_len is None:
         logger.info(

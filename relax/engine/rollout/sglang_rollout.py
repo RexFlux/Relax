@@ -16,9 +16,7 @@ import httpx
 import numpy as np
 import pybase64
 import ray
-import sglang_router
 import torch
-from packaging.version import parse
 from tqdm import tqdm
 
 from relax.distributed.ray.rollout import _log_rollout_data
@@ -40,6 +38,7 @@ from relax.engine.rollout import on_policy_distillation as opd
 from relax.engine.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput, request_slots
 from relax.engine.rollout.partial_genrm import PartialGenRM, PartialGenRMAborted
 from relax.engine.rollout.request_permit import GenerationAborted, InferencePermitManager
+from relax.engine.rollout.transfer_tasks import _await_with_transfers, _cancel_after_error, _settle_after_error
 from relax.utils.async_utils import run
 from relax.utils.data.data import Dataset
 from relax.utils.data.processing_utils import (
@@ -52,11 +51,11 @@ from relax.utils.data.processing_utils import (
 )
 from relax.utils.data.processor_pool import ProcessorPool, prepare_mm_inputs_for_ipc, process_sample_in_worker
 from relax.utils.http_utils import (
-    get,
+    get_router_worker_urls,
     is_expected_sglang_499,
     is_router_no_available_workers,
     post,
-    router_worker_base_urls,
+    router_routing_policies,
 )
 from relax.utils.logging_utils import get_logger
 from relax.utils.misc import SingletonMeta, load_function
@@ -369,7 +368,7 @@ def _decode_rollout_indexer_topk(meta_info: dict[str, Any], num_rows: int) -> np
 async def _post_generation(
     args: Namespace, state: "GenerateState", url: str, payload: dict, headers: dict | None, evaluation: bool
 ) -> Any:
-    router_recovery_enabled = not evaluation and args.fully_async and not args.use_slime_router
+    router_recovery_enabled = not evaluation and args.fully_async
     for attempt in range(2):
         if attempt and state.abort_event.is_set():
             raise GenerationAborted
@@ -436,13 +435,6 @@ async def _generate(
     native_image_opd = opd_enabled and _has_media
     if native_image_opd:
         image_inputs(sample.multimodal_inputs)
-    if (
-        opd_enabled
-        and args.use_slime_router
-        and "RadixTreeMiddleware" in args.slime_router_middleware_paths
-        and (_has_media or image_inputs(sample.teacher_multimodal_inputs))
-    ):
-        raise ValueError("Native image OPD requires token-preserving routing; RadixTreeMiddleware uses text lookup.")
     from relax.utils.data.kimi_k3 import encode_kimi_k3_rollout_prompt, is_kimi_k3_tokenizer
 
     if is_kimi_k3_tokenizer(state.tokenizer):
@@ -528,12 +520,15 @@ async def _generate(
     # Provide a routing key so cache-affinity routers pin related requests to the same
     # engine and reuse its prefix/KV cache.
     headers = None
-    if args.sglang_router_policy == "consistent_hashing" and sample.session_id:
-        headers = {"X-SMG-Routing-Key": sample.session_id}
-    elif args.slime_router_sticky and sample.group_index is not None:
+    routing_policies = router_routing_policies(args)
+    if "manual" in routing_policies:
         # Pin all samples of one prompt group to the same engine so the shared prompt
         # prefix is prefilled once and reused across the group.
-        headers = {"X-SMG-Routing-Key": str(sample.group_index)}
+        routing_key = str(sample.group_index) if sample.group_index is not None else sample.session_id
+        if routing_key:
+            headers = {"X-SMG-Routing-Key": routing_key}
+    elif "consistent_hashing" in routing_policies and sample.session_id:
+        headers = {"X-SMG-Routing-Key": sample.session_id}
 
     _t_generate_start = monotonic()
     output = await _post_generation(args, state, url, payload, headers, evaluation)
@@ -562,115 +557,97 @@ async def _generate(
 
     captured_replay_tokens = None
     _t_post_generate_start = monotonic()
-    if args.use_slime_router and "RadixTreeMiddleware" in args.slime_router_middleware_paths:
-        from relax.engine.router.middleware.radix_tree_middleware import postprocess_sample_with_radix_tree
-
-        sample = await postprocess_sample_with_radix_tree(args, sample, output)
-        if sc_result is not None:
-            sc_tokens, sc_sampled, sc_ids, sc_logprobs, sc_complete = sc_result
-            response_tokens = sample.tokens[-sample.response_length :] if sample.response_length else []
-            if response_tokens != sc_tokens:
-                raise ValueError(
-                    "Score Centering cannot align generation-time candidates with the radix-tree retrieved trajectory"
-                )
-            sample.rollout_log_probs = sc_sampled
-            sample.rollout_topk_token_ids = sc_ids
-            sample.rollout_topk_log_probs = sc_logprobs
-            sample.rollout_topk_support_complete = sc_complete
+    if "output_token_logprobs" in output["meta_info"]:
+        new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
+        new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
     else:
-        if "output_token_logprobs" in output["meta_info"]:
-            new_response_tokens = [item[1] for item in output["meta_info"]["output_token_logprobs"]]
-            new_response_log_probs = [item[0] for item in output["meta_info"]["output_token_logprobs"]]
-        else:
-            new_response_tokens = output["output_ids"]
-            new_response_log_probs = []
+        new_response_tokens = output["output_ids"]
+        new_response_log_probs = []
 
-        if opd_enabled:
-            new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
-                output["meta_info"], new_response_tokens, new_response_log_probs
-            )
-
-        if sc_result is not None:
-            new_response_tokens, new_response_log_probs, *_ = sc_result
-            # Keep an independent copy to detect in-place token sanitization.
-            sc_tokens_before_sanitization = list(new_response_tokens)
-
-        if native_image_opd:
-            media_token_ids = {
-                getattr(state.tokenizer, name, None) for name in ("image_token_id", "audio_token_id", "video_token_id")
-            }
-            media_token_ids.add(get_image_token_id(state.processor, state.tokenizer))
-            if any(token in media_token_ids for token in new_response_tokens):
-                raise ValueError("Native image OPD cannot replace sampled media tokens; configure a stop token.")
-
-        captured_replay_tokens = replay_producer.capture_tokens_before_normalization(
-            sample.tokens, new_response_tokens, state.tokenizer, state.processor, evaluation=evaluation
+    if opd_enabled:
+        new_response_tokens, new_response_log_probs = state.opd_manager.parse_rollout_logprobs(
+            output["meta_info"], new_response_tokens, new_response_log_probs
         )
 
-        while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.image_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Image token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at image_token_id if you want to avoid this."
-            )
+    if sc_result is not None:
+        new_response_tokens, new_response_log_probs, *_ = sc_result
+        # Keep an independent copy to detect in-place token sanitization.
+        sc_tokens_before_sanitization = list(new_response_tokens)
 
-        while hasattr(state.tokenizer, "audio_token_id") and state.tokenizer.audio_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.audio_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Audio token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at audio_token_id if you want to avoid this."
-            )
+    if native_image_opd:
+        media_token_ids = {
+            getattr(state.tokenizer, name, None) for name in ("image_token_id", "audio_token_id", "video_token_id")
+        }
+        media_token_ids.add(get_image_token_id(state.processor, state.tokenizer))
+        if any(token in media_token_ids for token in new_response_tokens):
+            raise ValueError("Native image OPD cannot replace sampled media tokens; configure a stop token.")
 
-        while hasattr(state.tokenizer, "video_token_id") and state.tokenizer.video_token_id in new_response_tokens:
-            index = new_response_tokens.index(state.tokenizer.video_token_id)
-            new_response_tokens[index] = state.tokenizer.pad_token_id
-            logger.warning(
-                "Video token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at video_token_id if you want to avoid this."
-            )
+    captured_replay_tokens = replay_producer.capture_tokens_before_normalization(
+        sample.tokens, new_response_tokens, state.tokenizer, state.processor, evaluation=evaluation
+    )
 
-        # K2.x tokenizers don't expose image_token_id but reserve <|media_pad|>
-        # for vision input slots. A hallucinated <|media_pad|> in the response
-        # inflates num_placeholders past sum(feature_lengths) in the bridge,
-        # forcing dynamic expansion → broadcast → 233 GiB OOM. Replace in-place
-        # so positional accounting matches sglang's per-token logprobs.
-        if state.processor is not None:
-            from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
+    while hasattr(state.tokenizer, "image_token_id") and state.tokenizer.image_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.image_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Image token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at image_token_id if you want to avoid this."
+        )
 
-            sanitized = sanitize_kimi_k25_response_tokens(state.processor, new_response_tokens)
-            if sanitized is not new_response_tokens:
-                replaced = sum(1 for a, b in zip(new_response_tokens, sanitized, strict=True) if a != b)
-                if replaced:
-                    logger.warning(
-                        f"K2.x: replaced {replaced} stray <|media_pad|> token(s) in rollout response with pad_token_id."
-                    )
-                new_response_tokens = sanitized
+    while hasattr(state.tokenizer, "audio_token_id") and state.tokenizer.audio_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.audio_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Audio token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at audio_token_id if you want to avoid this."
+        )
 
-        if captured_replay_tokens is not None:
-            normalized_replay_tokens = sample.tokens + new_response_tokens
+    while hasattr(state.tokenizer, "video_token_id") and state.tokenizer.video_token_id in new_response_tokens:
+        index = new_response_tokens.index(state.tokenizer.video_token_id)
+        new_response_tokens[index] = state.tokenizer.pad_token_id
+        logger.warning(
+            "Video token found in output tokens, replaced with pad_token_id. Consider updating the model's stop condition to stop at video_token_id if you want to avoid this."
+        )
 
-        # Update sample with tokens directly - avoiding re-tokenization
-        if sc_result is not None and new_response_tokens != sc_tokens_before_sanitization:
-            raise ValueError(
-                "Score Centering requires unchanged generated token IDs to preserve behavior probabilities"
-            )
-        sample.tokens = sample.tokens + new_response_tokens
-        sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
-        sample.response_length += len(new_response_tokens)
-        sample.response += output["text"]
+    # K2.x tokenizers don't expose image_token_id but reserve <|media_pad|>
+    # for vision input slots. A hallucinated <|media_pad|> in the response
+    # inflates num_placeholders past sum(feature_lengths) in the bridge,
+    # forcing dynamic expansion → broadcast → 233 GiB OOM. Replace in-place
+    # so positional accounting matches sglang's per-token logprobs.
+    if state.processor is not None:
+        from relax.utils.data.processing_utils import sanitize_kimi_k25_response_tokens
 
-        # When partial rollout and masking off policy is enabled, update the loss mask
-        if sample.loss_mask is not None:
-            assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
-            sample.loss_mask += [1] * len(new_response_tokens)
+        sanitized = sanitize_kimi_k25_response_tokens(state.processor, new_response_tokens)
+        if sanitized is not new_response_tokens:
+            replaced = sum(1 for a, b in zip(new_response_tokens, sanitized, strict=True) if a != b)
+            if replaced:
+                logger.warning(
+                    f"K2.x: replaced {replaced} stray <|media_pad|> token(s) in rollout response with pad_token_id."
+                )
+            new_response_tokens = sanitized
 
-        if sample.rollout_log_probs is None:
-            sample.rollout_log_probs = []
-        sample.rollout_log_probs += new_response_log_probs
-        if sc_result is not None:
-            append_score_centering_candidates(sample, *sc_result[2:])
+    if captured_replay_tokens is not None:
+        normalized_replay_tokens = sample.tokens + new_response_tokens
 
-        if opd_enabled:
-            state.opd_manager.after_rollout(sample, output)
+    # Update sample with tokens directly - avoiding re-tokenization
+    if sc_result is not None and new_response_tokens != sc_tokens_before_sanitization:
+        raise ValueError("Score Centering requires unchanged generated token IDs to preserve behavior probabilities")
+    sample.tokens = sample.tokens + new_response_tokens
+    sample.rollout_tokens = sample.rollout_tokens + new_response_tokens
+    sample.response_length += len(new_response_tokens)
+    sample.response += output["text"]
+
+    # When partial rollout and masking off policy is enabled, update the loss mask
+    if sample.loss_mask is not None:
+        assert args.partial_rollout and args.mask_offpolicy_in_partial_rollout
+        sample.loss_mask += [1] * len(new_response_tokens)
+
+    if sample.rollout_log_probs is None:
+        sample.rollout_log_probs = []
+    sample.rollout_log_probs += new_response_log_probs
+    if sc_result is not None:
+        append_score_centering_candidates(sample, *sc_result[2:])
+
+    if opd_enabled:
+        state.opd_manager.after_rollout(sample, output)
 
     if captured_replay_tokens is not None and sample.tokens != normalized_replay_tokens:
         raise ValueError("Replay tokens changed after media normalization")
@@ -846,6 +823,34 @@ def _aggregate_rollout_timing(all_samples: list[Sample], get_samples_times: list
     return metrics
 
 
+_REWARD_TIMING: list[tuple[float, float]] = []
+
+
+def _reset_reward_timing() -> None:
+    _REWARD_TIMING.clear()
+
+
+def _record_reward_timing(start: float, end: float) -> None:
+    _REWARD_TIMING.append((start, end))
+
+
+def _aggregate_reward_timing() -> dict[str, float]:
+    intervals = _REWARD_TIMING
+    if not intervals:
+        return {}
+    durations = [end - start for start, end in intervals]
+    last_end = max(end for _, end in intervals)
+    return {
+        "perf/reward_time/groups": float(len(intervals)),
+        "perf/reward_time/sum": sum(durations),
+        "perf/reward_time/mean": sum(durations) / len(durations),
+        "perf/reward_time/max": max(durations),
+        "perf/reward_time/wall": last_end - min(start for start, _ in intervals),
+        # Parallel work is not additive wall time: only this tail extends generation.
+        "perf/reward_time/critical": max(0.0, last_end - max(start for start, _ in intervals)),
+    }
+
+
 async def generate_and_rm_group(
     args: Namespace, group: list[Sample], sampling_params: dict[str, Any], evaluation: bool = False
 ) -> list[Sample]:
@@ -907,8 +912,11 @@ async def generate_and_rm_group(
             rows.extend(outputs)
         return await _score_generated_group(args, state, rows, evaluation, teacher_routing_enabled)
     except BaseException as error:
-        if references_enabled() and not evaluation:
-            await discard_failed_generation(replay_data_manager, tasks, group, error)
+        try:
+            await _cancel_after_error(error, tasks)
+        finally:
+            if references_enabled() and not evaluation:
+                await discard_failed_generation(replay_data_manager, tasks, group, error)
         raise
 
 
@@ -925,7 +933,10 @@ async def _score_generated_group(
                 state.opd_manager.response_stats.finish(sample.response_key)
         return group
 
+    reward_start = monotonic()
     rewards = await batched_async_rm(args, group, evaluation=evaluation)
+    if not evaluation:
+        _record_reward_timing(reward_start, monotonic())
     for sample, reward in zip(group, rewards, strict=False):
         sample.reward = reward
 
@@ -973,14 +984,7 @@ async def abort(args: Namespace, rollout_id: int) -> tuple[list[list[Sample]], l
     state.aborted = True
     state.abort_event.set()
 
-    if parse(sglang_router.__version__) <= parse("0.2.1") or args.use_slime_router:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/list_workers")
-        urls = response["urls"]
-    else:
-        response = await get(f"http://{args.sglang_router_ip}:{args.sglang_router_port}/workers")
-        urls = [worker["url"] for worker in response["workers"]]
-
-    urls = router_worker_base_urls(urls)
+    urls = await get_router_worker_urls(f"http://{args.sglang_router_ip}:{args.sglang_router_port}")
     logger.info(f"Abort request for {urls}")
     abort_tasks = [post(f"{url}/abort_request", {"abort_all": True}) for url in urls]
     partial_genrm = getattr(state, "partial_genrm", None)
@@ -1049,28 +1053,19 @@ async def generate_rollout_async(
 ) -> tuple[RolloutFnTrainOutput, list[list[Sample]]]:
     state = GenerateState(args)
     recovery = getattr(args, "inference_recovery", False)
-    if recovery:
-        state.recovery_transfers = []
+    state.recovery_transfers = []
     try:
         return await _generate_rollout_async(args, rollout_id, data_source, data_system_client)
-    except Exception:
-        if not recovery:
-            raise
-        from relax.distributed.settlement import UnsafeInferenceError
-
-        # Local HTTP awaits may be cancelled, but dispatched storage writes must settle.
-        tasks = state.pendings | state.protected_pendings
-        for task in tasks:
-            task.cancel()
-        pending = list(tasks) + state.recovery_transfers
-        if pending:
-            done, unfinished = await asyncio.wait(pending, timeout=60)
-            if unfinished:
-                raise UnsafeInferenceError("Old generation work is still running; require global restart")
-            await asyncio.gather(*done, return_exceptions=True)
-            writes_failed = any(task.cancelled() or task.exception() is not None for task in state.recovery_transfers)
-            if writes_failed:
-                raise UnsafeInferenceError("Old storage writes failed; their effects are uncertain")
+    except BaseException as error:
+        state.aborted = True
+        state.abort_event.set()
+        owned = list(state.pendings | state.protected_pendings)
+        try:
+            await _settle_after_error(error, owned, state.recovery_transfers, recovery=recovery)
+        finally:
+            settled = {task for task in owned if task.done()}
+            state.pendings.difference_update(settled)
+            state.protected_pendings.difference_update(settled)
         raise
     finally:
         if (partial_genrm := getattr(state, "partial_genrm", None)) is not None:
@@ -1142,10 +1137,10 @@ async def _generate_rollout_async(
 
     data = []
     do_print = True
+    _reset_reward_timing()
     pbar = tqdm(total=target_data_size * args.n_samples_per_prompt, desc=f"Rollout {rollout_id} generation")
     transfer_tasks = []
-    if getattr(args, "inference_recovery", False):
-        state.recovery_transfers = transfer_tasks
+    state.recovery_transfers = transfer_tasks
     batch_to_transfer = []
     aborted_samples = []
     # Collect completed surplus until this step ends. Plain synchronous mode
@@ -1197,18 +1192,20 @@ async def _generate_rollout_async(
             else:
                 ref = data_source.get_samples.remote(args.over_sampling_batch_size + num_old_samples)
 
-            samples = await loop.run_in_executor(None, ray.get, ref)
+            samples = await _await_with_transfers(loop.run_in_executor(None, ray.get, ref), transfer_tasks)
             replay_data_manager.receive_buffered_routes(samples)
 
             get_samples_times.append(monotonic() - _t_get_samples)
             state.submit_generate_tasks(samples)
         # wait for the generation to finish (from both normal and protected pending sets)
         all_pendings = state.pendings | state.protected_pendings
-        done, remaining = await asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED)
-        state.pendings = state.pendings & remaining
-        state.protected_pendings = state.protected_pendings & remaining
+        done, _ = await _await_with_transfers(
+            asyncio.wait(all_pendings, return_when=asyncio.FIRST_COMPLETED), transfer_tasks
+        )
         for task in done:
             group: list[Sample] = task.result()
+            state.pendings.discard(task)
+            state.protected_pendings.discard(task)
 
             if do_print:
                 sample = group[0]
@@ -1394,7 +1391,8 @@ async def _generate_rollout_async(
     logger.info(f"Generator exhausted. Waiting for {len(transfer_tasks)} transfer tasks to complete...")
     # Wait for all transfer tasks to complete
     if transfer_tasks:
-        await asyncio.gather(*transfer_tasks)
+        # Cancellation must not cancel writes already dispatched to storage.
+        await asyncio.shield(asyncio.gather(*transfer_tasks))
     pbar.close()
 
     # Stop SGLang profiling if enabled (no-op if num_steps was set — SGLang auto-stops)
@@ -1409,6 +1407,7 @@ async def _generate_rollout_async(
 
     all_samples = [sample for group in data for sample in (group if isinstance(group, list) else [group])]
     timing_metrics = _aggregate_rollout_timing(all_samples, get_samples_times)
+    timing_metrics |= _aggregate_reward_timing()
 
     # there are still some unfinished requests, abort them
     # abort() returns (aborted_samples, completed_protected_samples)
@@ -1486,7 +1485,11 @@ async def _generate_rollout_async(
             for group in accepted:
                 data.append(group)
             if accepted:
-                await transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                transfer_task = asyncio.create_task(
+                    transfer_batch_to_data_system(args, accepted, len(accepted), rollout_id, data_system_client)
+                )
+                transfer_tasks.append(transfer_task)
+                await asyncio.shield(transfer_task)
             logger.info(f"Transferred {len(accepted)} extra completed groups to training ")
 
     global CURRENT_ROLLOUT_BATCH

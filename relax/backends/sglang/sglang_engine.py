@@ -12,7 +12,8 @@ import sys
 import tempfile
 import threading
 import time
-from typing import Optional
+from collections.abc import Callable
+from typing import Any, Optional
 from urllib.parse import quote, urlsplit
 
 import ray
@@ -334,6 +335,35 @@ def _patched_run_scheduler_process(*args, **kwargs):
     return run_scheduler_process(*args, **kwargs)
 
 
+def _run_scheduler_with_model_loading_timeout(
+    *args: Any, scheduler_entrypoint: Callable[..., Any] | None = None, **kwargs: Any
+) -> Any:
+    """Apply the post-load barrier budget inside the scheduler subprocess."""
+    from sglang.srt.model_executor import model_runner
+
+    # SGLang 0.5.21 moved the barrier out of ModelRunner. Update the module
+    # that consumes the constant, rather than creating an unused attribute.
+    if hasattr(model_runner, "UNBALANCED_MODEL_LOADING_TIMEOUT_S"):
+        loading_module = model_runner
+    else:
+        from sglang.srt.model_executor.model_runner_components import load_model_utils
+
+        loading_module = load_model_utils
+    previous = loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S
+    loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S = Envs.RELAX_MODEL_LOADING_TIMEOUT_S
+    logger.info(
+        "Model loading barrier timeout: %s -> %ss",
+        previous,
+        loading_module.UNBALANCED_MODEL_LOADING_TIMEOUT_S,
+    )
+
+    if scheduler_entrypoint is None:
+        from sglang.srt.managers.scheduler import run_scheduler_process
+
+        scheduler_entrypoint = run_scheduler_process
+    return scheduler_entrypoint(*args, **kwargs)
+
+
 def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, reference_publication: bool = False):
     """Launch the server with the capture hooks configured by its engine."""
     from sglang.srt.entrypoints.http_server import launch_server
@@ -345,18 +375,22 @@ def _launch_server_with_patches(server_args: ServerArgs, parent_pid: int, refere
     if os.getppid() != parent_pid:
         return
 
+    launch_kwargs = {}
     if reference_publication:
         from relax.distributed.replay_manager.backend.sglang import run_reference_detokenizer, run_reference_scheduler
 
-        launch_server(
-            server_args,
-            run_scheduler_process_func=run_reference_scheduler,
-            run_detokenizer_process_func=run_reference_detokenizer,
-        )
+        launch_kwargs = {
+            "run_scheduler_process_func": run_reference_scheduler,
+            "run_detokenizer_process_func": run_reference_detokenizer,
+        }
     elif Envs.RELAX_OPTIMIZE_ROUTING_REPLAY:
-        launch_server(server_args, run_scheduler_process_func=_patched_run_scheduler_process)
-    else:
-        launch_server(server_args)
+        launch_kwargs["run_scheduler_process_func"] = _patched_run_scheduler_process
+    if Envs.RELAX_MODEL_LOADING_TIMEOUT_S > 0:
+        launch_kwargs["run_scheduler_process_func"] = functools.partial(
+            _run_scheduler_with_model_loading_timeout,
+            scheduler_entrypoint=launch_kwargs.get("run_scheduler_process_func"),
+        )
+    launch_server(server_args, **launch_kwargs)
 
 
 def _resolve_external_model_arch(package_name):
@@ -491,6 +525,7 @@ class SGLangEngine(RayActor):
         register_sigterm_handler: bool = False,
     ):
         self.args = args
+        self.is_policy_engine = getattr(args, "_fsdp_turbo_policy_engine", True)
         self.rank = rank
         self.worker_type = worker_type
         self.base_gpu_id = base_gpu_id
@@ -679,6 +714,19 @@ class SGLangEngine(RayActor):
             if self._is_scaled_out:
                 server_args_dict = _materialize_scaled_out_s3_model(server_args_dict, self.args)
             server_args_dict = _apply_sglang_policy_load_plan(server_args_dict, self.args)
+            if (
+                getattr(self.args, "train_backend", None) == "fsdp_turbo"
+                and not getattr(self.args, "debug_rollout_only", False)
+                and self.is_policy_engine
+            ):
+                from relax.backends.fsdp_turbo.turbo_config_utils import get_turbo_sglang_model_override
+
+                config_path = resolve_s3_model_metadata_to_shm(server_args_dict["model_path"], self.args)
+                server_args_dict["json_model_override_args"] = get_turbo_sglang_model_override(
+                    self.args.turbo_config,
+                    config_path,
+                    server_args_dict.get("json_model_override_args"),
+                )
 
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
         if getattr(self.args, "optimize_routing_replay", False):
@@ -776,6 +824,18 @@ class SGLangEngine(RayActor):
         )
         response.raise_for_status()
         return True
+
+    def begin_weight_update(self):
+        """Open the scheduler's tensor weight-update session."""
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("begin_weight_update", {"selector": "all"}, timeout=120)
+
+    def end_weight_update(self):
+        """Finalize weights before resuming generation."""
+        if not _sglang_has_weight_update_session():
+            return
+        return self._make_request("end_weight_update", {}, timeout=120)
 
     def update_weights_from_tensor(
         self,
@@ -1219,84 +1279,71 @@ class SGLangEngine(RayActor):
                 return True
             if required and self.worker_type == "prefill" and bootstrap_port is None:
                 bootstrap_port = self._router_bootstrap_port
-            if parse(sglang_router.__version__) <= parse("0.2.1") or self.args.use_slime_router:
-                if self.worker_type != "regular":
-                    msg = "pd disaggregation is not supported in old router or slime router."
-                    if strict:
-                        raise ValueError(msg)
-                    logger.warning(msg)
-                    return False
+            payload = {
+                "url": worker_url,
+                "worker_type": self.worker_type,
+            }
+            if (required or getattr(self, "_is_scaled_out", False)) and parse(sglang_router.__version__) >= parse(
+                "0.3.0"
+            ):
+                payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
+            if self.worker_type == "prefill" and bootstrap_port is not None:
+                payload["bootstrap_port"] = bootstrap_port
+            if required:
+                # The router may accept the worker before its HTTP response
+                # is lost. Reconcile that mutation instead of posting twice.
+                self._router_registration_pending = True
+                self._router_worker_id = None
+            try:
                 response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/add_worker?url={worker_url}",
+                    f"http://{self.router_ip}:{self.router_port}/workers",
+                    json=payload,
                     timeout=30,
                 )
-            else:
-                payload = {
-                    "url": worker_url,
-                    "worker_type": self.worker_type,
-                }
-                if (required or getattr(self, "_is_scaled_out", False)) and parse(sglang_router.__version__) >= parse(
-                    "0.3.0"
-                ):
-                    payload["labels"] = {"relax_actor_id": ray.get_runtime_context().get_actor_id()}
-                if self.worker_type == "prefill" and bootstrap_port is not None:
-                    payload["bootstrap_port"] = bootstrap_port
+            except ConnectTimeout:
                 if required:
-                    # The router may accept the worker before its HTTP response
-                    # is lost. Reconcile that mutation instead of posting twice.
-                    self._router_registration_pending = True
-                    self._router_worker_id = None
-                try:
-                    response = requests.post(
-                        f"http://{self.router_ip}:{self.router_port}/workers",
-                        json=payload,
-                        timeout=30,
+                    self._router_registration_pending = False
+                raise
+            if required and response.status_code >= 400:
+                # Client rejections and the router's queue errors prove
+                # that no registration was submitted. A gateway timeout
+                # or an unrecognized server error can still hide acceptance.
+                rejected = 400 <= response.status_code < 500 and response.status_code != 408
+                if response.status_code == 500:
+                    try:
+                        body = response.json()
+                    except ValueError:
+                        body = None
+                    rejected = (
+                        isinstance(body, dict)
+                        and body.get("code") == "INTERNAL_SERVER_ERROR"
+                        and isinstance(body.get("error"), str)
                     )
-                except ConnectTimeout:
-                    if required:
-                        self._router_registration_pending = False
-                    raise
-                if required and response.status_code >= 400:
-                    # Client rejections and the router's queue errors prove
-                    # that no registration was submitted. A gateway timeout
-                    # or an unrecognized server error can still hide acceptance.
-                    rejected = 400 <= response.status_code < 500 and response.status_code != 408
-                    if response.status_code == 500:
-                        try:
-                            body = response.json()
-                        except ValueError:
-                            body = None
-                        rejected = (
-                            isinstance(body, dict)
-                            and body.get("code") == "INTERNAL_SERVER_ERROR"
-                            and isinstance(body.get("error"), str)
-                        )
-                    if rejected:
-                        self._router_registration_pending = False
+                if rejected:
+                    self._router_registration_pending = False
             response.raise_for_status()
             self._router_worker_id = None
-            if parse(sglang_router.__version__) > parse("0.2.1") and not self.args.use_slime_router:
+            try:
+                response_payload = response.json()
+            except ValueError:
+                response_payload = {}
+            if isinstance(response_payload, dict):
+                worker_id = response_payload.get("worker_id")
+                if worker_id is not None and str(worker_id):
+                    self._router_worker_id = str(worker_id)
+            if self._router_worker_id is None:
+                location = response.headers.get("Location")
+                if not location and isinstance(response_payload, dict):
+                    location = response_payload.get("location")
                 try:
-                    response_payload = response.json()
-                except ValueError:
-                    response_payload = {}
-                if isinstance(response_payload, dict):
-                    worker_id = response_payload.get("worker_id")
-                    if worker_id is not None and str(worker_id):
-                        self._router_worker_id = str(worker_id)
-                if self._router_worker_id is None:
-                    location = response.headers.get("Location")
-                    if not location and isinstance(response_payload, dict):
-                        location = response_payload.get("location")
-                    try:
-                        location_path = urlsplit(location).path.rstrip("/")
-                    except (TypeError, ValueError):
-                        location_path = ""
-                    parent_path, separator, worker_id = location_path.rpartition("/")
-                    if separator and parent_path.endswith("/workers") and worker_id:
-                        self._router_worker_id = worker_id
-                if self._router_worker_id is None:
-                    logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
+                    location_path = urlsplit(location).path.rstrip("/")
+                except (TypeError, ValueError):
+                    location_path = ""
+                parent_path, separator, worker_id = location_path.rpartition("/")
+                if separator and parent_path.endswith("/workers") and worker_id:
+                    self._router_worker_id = worker_id
+            if self._router_worker_id is None:
+                logger.warning(f"Router did not return a worker_id while registering engine {worker_url}.")
             self._router_unregister_submitted = False
             if required:
                 self._router_registration_pending = True
@@ -1348,12 +1395,7 @@ class SGLangEngine(RayActor):
             return removed
 
         try:
-            if router_version <= parse("0.2.1") or self.args.use_slime_router:
-                response = requests.post(
-                    f"http://{self.router_ip}:{self.router_port}/remove_worker?url={worker_url}",
-                    timeout=timeout,
-                )
-            elif router_version < parse("0.3.0"):
+            if router_version < parse("0.3.0"):
                 response = requests.delete(
                     f"http://{self.router_ip}:{self.router_port}/workers/{quote(worker_url, safe='')}",
                     timeout=timeout,
@@ -1776,25 +1818,6 @@ class SGLangEngine(RayActor):
         response.raise_for_status()
         return response
 
-    def begin_weight_update(self):
-        """Open a weight-update session; newer SGLang rejects weight loads
-        outside one.
-
-        No-op on older SGLang.
-        """
-        if not _sglang_has_weight_update_session():
-            return
-        return self._make_request("begin_weight_update", {})
-
-    def end_weight_update(self):
-        """Close the session opened by ``begin_weight_update``.
-
-        No-op on older SGLang.
-        """
-        if not _sglang_has_weight_update_session():
-            return
-        return self._make_request("end_weight_update", {})
-
     def post_process_weights(
         self,
         restore_weights_before_load: bool = False,
@@ -2130,6 +2153,7 @@ def _compute_genrm_server_args(
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
         and not device_utils.is_rocm
+        and (kwargs.get("device") or ("npu" if device_utils.is_npu_available else "cuda")) == "cuda"
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2263,6 +2287,7 @@ def _compute_server_args(
         and kwargs.get("mm_feature_transport") is None
         and kwargs["nnodes"] == 1
         and not device_utils.is_rocm
+        and (kwargs.get("device") or ("npu" if device_utils.is_npu_available else "cuda")) == "cuda"
     ):
         kwargs["mm_feature_transport"] = "cuda_ipc"
 
@@ -2284,7 +2309,6 @@ def _compute_server_args(
         if EXPERT_SLICE_LOADER not in loaders:
             loaders.append(EXPERT_SLICE_LOADER)
         kwargs["custom_weight_loader"] = loaders
-
     if (
         "cuda_graph_backend_prefill" in server_arg_field_names
         and kwargs.get("enable_memory_saver")
